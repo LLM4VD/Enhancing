@@ -1,0 +1,8 @@
+###Vulnerable Lines
+{
+  "LINE1": "if (l_strnstart(\"MSG\", 4, (const char *)bp, length))",
+  "LINE2": "if (l_strnstart(\"RPY \", 4, (const char *)bp, length))",
+  "LINE3": "if (l_strnstart(\"ERR \", 4, (const char *)bp, length))",
+  "LINE4": "if (l_strnstart(\"ANS \", 4, (const char *)bp, length))",
+  "LINE5": "if (l_strnstart(\"NUL \", 4, (const char *)bp, length))"
+}

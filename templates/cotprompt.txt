@@ -1,0 +1,11 @@
+Please perform a vulnerability detection on the following function and determine whether it contains a vulnerability, analyzing step by step following the instructions below:
+    Step 1: Read and understand the given function code to determine its main purpose and functionality.
+    Step 2: Identify the input parameters and their types, as well as the function's return value and its type.
+    Step 3: Analyze the function's behavior under various boundary conditions, including extreme values, null values, and illegal inputs.
+    Step 4: Check the function for the following common vulnerabilities one by one:
+    Buffer Overflow
+    SQL Injection
+    Cross-Site Scripting (XSS)
+    Privilege Escalation
+    Other potential vulnerabilities
+    Step 5: Based on the analysis results, decide whether this function is vulnerable. The answer of Step5 should be in the json format {"VULNERABLE": "YES/NO"}

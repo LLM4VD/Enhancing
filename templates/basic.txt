@@ -1,0 +1,1 @@
+Please perform a vulnerability detection on the following function and determine whether it contains a vulnerability. The answer should be in the json format {"VULNERABLE": "YES/NO"}.

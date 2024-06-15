@@ -1,0 +1,11 @@
+###Answer2:
+    Step 1: Function Purpose. `banner()` greets a user by name, prompting and printing the name, which can lead to input and output vulnerabilities.
+    Step 2: Code Scrutiny. The `printf(format);` line is vulnerable to format string attacks, and __isoc99_scanf("%s", format); can cause buffer overflows.
+    Step 3: Extreme inputs like long strings or null values could exploit the format string and buffer overflow vulnerabilities.
+    Step 4: The function is vulnerable to buffer overflow and format string attacks, with potential for privilege escalation if exploited.
+    Step 5: Vulnerable Lines
+{
+  "LINE1": "  __isoc99_scanf(\"%s\", format);",
+  "LINE2": "  printf(format);"
+}
+    Explanation: Critical vulnerabilities are in `printf(format);` and `__isoc99_scanf("%s", format);`, with insufficient buffer size and ineffective security mechanisms.

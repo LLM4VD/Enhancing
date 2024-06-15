@@ -1,0 +1,19 @@
+It is known that the following function contains vulnerabilities. You need to locate the specific lines that cause the vulnerabilities. Analyzing step by step following the instructions below:
+    Step1: Grasp the function's purpose and how it processes inputs and outputs to target potential vulnerability areas.
+    Step2: Scrutinize each line of code, focusing on data handling and control flow, to spot anomalies like unmanaged exceptions or flawed logic.
+    Step3: Explore the function's behavior at its limits (e.g., extreme values, nulls) to uncover vulnerabilities in these critical scenarios.
+    Step4: Check the function for the following common vulnerabilities one by one:
+    Buffer Overflow
+    SQL Injection
+    Cross-Site Scripting (XSS)
+    Privilege Escalation
+    Other potential vulnerabilities
+    Step5: For each identified vulnerability, pinpoint the exact code line where the vulnerability exists and provide a brief explanation of reason. 
+    And finally provide no more than 5 possible vulnerable lines of code. Answer only in the following JSON format:
+{
+  "LINE1": "code line 1",
+  "LINE2": "code line 2",
+  "LINE3": "code line 3",
+  "LINE4": "code line 4",
+  "LINE5": "code line 5"
+}

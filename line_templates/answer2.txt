@@ -1,0 +1,5 @@
+###Vulnerable Lines
+{
+  "LINE1": "  __isoc99_scanf(\"%s\", format);",
+  "LINE2": "  printf(format);"
+}

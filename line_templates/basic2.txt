@@ -1,0 +1,60 @@
+The following function is known to contain vulnerabilities. Your task is to locate the specific lines of code that cause these vulnerabilities. You should provide no more than 5 possible vulnerable lines of code. Answer only in the following JSON format:
+
+{
+  "LINE1": "code line 1",
+  "LINE2": "code line 2",
+  "LINE3": "code line 3",
+  "LINE4": "code line 4",
+  "LINE5": "code line 5"
+}
+
+###Vulnerable Function1:
+"""
+beep_print(netdissect_options *ndo, const u_char *bp, u_int length) {
+    if (l_strnstart("MSG", 4, (const char *)bp, length)) /* A REQuest */
+        ND_PRINT((ndo, " BEEP MSG"));
+    else if (l_strnstart("RPY ", 4, (const char *)bp, length))
+        ND_PRINT((ndo, " BEEP RPY"));
+    else if (l_strnstart("ERR ", 4, (const char *)bp, length))
+        ND_PRINT((ndo, " BEEP ERR"));
+    else if (l_strnstart("ANS ", 4, (const char *)bp, length))
+        ND_PRINT((ndo, " BEEP ANS"));
+    else if (l_strnstart("NUL ", 4, (const char *)bp, length))
+        ND_PRINT((ndo, " BEEP NUL"));
+    else if (l_strnstart("SEQ ", 4, (const char *)bp, length))
+        ND_PRINT((ndo, " BEEP SEQ"));
+    else if (l_strnstart("END", 4, (const char *)bp, length))
+        ND_PRINT((ndo, " BEEP END"));
+    else
+        ND_PRINT((ndo, " BEEP (payload or undecoded)"));
+}
+"""
+###Vulnerable Lines
+{
+  "LINE1": "if (l_strnstart(\"MSG\", 4, (const char *)bp, length))",
+  "LINE2": "if (l_strnstart(\"RPY \", 4, (const char *)bp, length))",
+  "LINE3": "if (l_strnstart(\"ERR \", 4, (const char *)bp, length))",
+  "LINE4": "if (l_strnstart(\"ANS \", 4, (const char *)bp, length))",
+  "LINE5": "if (l_strnstart(\"NUL \", 4, (const char *)bp, length))"
+}
+
+###Vulnerable Function1:
+unsigned __int64 banner()
+{
+  char format[12];
+  unsigned __int64 v2;
+
+  v2 = __readfsqword(0x28u);
+  puts("Welcome to note management system!");
+  printf("Enter your name: ");
+  __isoc99_scanf("%s", format);
+  printf("Hello, ");
+  printf(format);
+  return __readfsqword(0x28u) ^ v2;
+}
+
+###Vulnerable Lines
+{
+  "LINE1": "  __isoc99_scanf(\"%s\", format);",
+  "LINE2": "  printf(format);"
+}

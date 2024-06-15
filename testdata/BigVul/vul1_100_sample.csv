@@ -1,0 +1,3229 @@
+func_before
+"    DidFinishNavigation(NavigationHandle* handle) {
+  if (handle->GetFrameTreeNodeId() != frame_tree_node_id_)
+    return;
+  if (!handle->HasCommitted())
+    return;
+  if (handle->GetRenderFrameHost()->GetSiteInstance() != parent_site_instance_)
+    return;
+  if (!handle->GetURL().IsAboutBlank())
+    return;
+  if (!handle->GetRenderFrameHost()->PrepareForInnerWebContentsAttach()) {
+    filter_->ResumeAttachOrDestroy(element_instance_id_,
+                                   MSG_ROUTING_NONE /* no plugin frame */);
+  }
+  base::PostTaskWithTraits(
+      FROM_HERE, {BrowserThread::UI},
+      base::BindOnce(&ExtensionsGuestViewMessageFilter::ResumeAttachOrDestroy,
+                     filter_, element_instance_id_,
+                     handle->GetRenderFrameHost()->GetRoutingID()));
+}
+"
+" ExtensionsGuestViewMessageFilter::ExtensionsGuestViewMessageFilter(
+     int render_process_id,
+    BrowserContext* context)
+    : GuestViewMessageFilter(kFilteredMessageClasses,
+                             base::size(kFilteredMessageClasses),
+                              render_process_id,
+                              context),
+       content::BrowserAssociatedInterface<mojom::GuestView>(this, this) {
+  GetProcessIdToFilterMap()->insert_or_assign(render_process_id_, this);
+ }
+"
+"void ExtensionsGuestViewMessageFilter::FrameNavigationHelper::FrameDeleted(
+    RenderFrameHost* render_frame_host) {
+  if (render_frame_host->GetFrameTreeNodeId() != frame_tree_node_id_)
+    return;
+  filter_->ResumeAttachOrDestroy(element_instance_id_,
+                                 MSG_ROUTING_NONE /* no plugin frame */);
+}
+"
+"ExtensionsGuestViewMessageFilter::FrameNavigationHelper::FrameNavigationHelper(
+    RenderFrameHost* plugin_rfh,
+    int32_t guest_instance_id,
+    int32_t element_instance_id,
+    bool is_full_page_plugin,
+    ExtensionsGuestViewMessageFilter* filter)
+    : content::WebContentsObserver(
+          content::WebContents::FromRenderFrameHost(plugin_rfh)),
+      frame_tree_node_id_(plugin_rfh->GetFrameTreeNodeId()),
+      guest_instance_id_(guest_instance_id),
+      element_instance_id_(element_instance_id),
+      is_full_page_plugin_(is_full_page_plugin),
+      filter_(filter),
+      parent_site_instance_(plugin_rfh->GetParent()->GetSiteInstance()),
+      weak_factory_(this) {
+  DCHECK(GetGuestView());
+  NavigateToAboutBlank();
+  base::PostDelayedTaskWithTraits(
+      FROM_HERE, {BrowserThread::UI},
+      base::BindOnce(&ExtensionsGuestViewMessageFilter::FrameNavigationHelper::
+                         CancelPendingTask,
+                     weak_factory_.GetWeakPtr()),
+      base::TimeDelta::FromMilliseconds(kAttachFailureDelayMS));
+}
+"
+"ExtensionsGuestViewMessageFilter::FrameNavigationHelper::GetGuestView() const {
+  return MimeHandlerViewGuest::From(
+             parent_site_instance_->GetProcess()->GetID(), guest_instance_id_)
+      ->As<MimeHandlerViewGuest>();
+}
+"
+"ProcessIdToFilterMap* GetProcessIdToFilterMap() {
+  static base::NoDestructor<ProcessIdToFilterMap> instance;
+  return instance.get();
+}
+"
+"ExtensionsGuestViewMessageFilter::MaybeCreateThrottle(
+    NavigationHandle* handle) {
+  DCHECK(content::MimeHandlerViewMode::UsesCrossProcessFrame());
+  if (!handle->GetParentFrame()) {
+    return nullptr;
+  }
+  int32_t parent_process_id = handle->GetParentFrame()->GetProcess()->GetID();
+  auto& map = *GetProcessIdToFilterMap();
+  if (!base::ContainsKey(map, parent_process_id) || !map[parent_process_id]) {
+    return nullptr;
+  }
+  for (auto& pair : map[parent_process_id]->frame_navigation_helpers_) {
+    if (!pair.second->ShouldCancelAndIgnore(handle))
+      continue;
+    return std::make_unique<CancelAndIgnoreNavigationForPluginFrameThrottle>(
+        handle);
+  }
+  return nullptr;
+}
+"
+"void ExtensionsGuestViewMessageFilter::MimeHandlerViewGuestCreatedCallback(
+    int element_instance_id,
+    int embedder_render_process_id,
+    int embedder_render_frame_id,
+    int32_t plugin_frame_routing_id,
+    const gfx::Size& element_size,
+    mime_handler::BeforeUnloadControlPtrInfo before_unload_control,
+    bool is_full_page_plugin,
+    WebContents* web_contents) {
+  auto* guest_view = MimeHandlerViewGuest::FromWebContents(web_contents);
+  if (!guest_view)
+    return;
+
+  guest_view->SetBeforeUnloadController(std::move(before_unload_control));
+  int guest_instance_id = guest_view->guest_instance_id();
+  auto* rfh = RenderFrameHost::FromID(embedder_render_process_id,
+                                      embedder_render_frame_id);
+  if (!rfh)
+    return;
+
+  guest_view->SetEmbedderFrame(embedder_render_process_id,
+                               embedder_render_frame_id);
+
+  base::DictionaryValue attach_params;
+  attach_params.SetInteger(guest_view::kElementWidth, element_size.width());
+  attach_params.SetInteger(guest_view::kElementHeight, element_size.height());
+  auto* manager = GuestViewManager::FromBrowserContext(browser_context_);
+  if (!manager) {
+    guest_view::bad_message::ReceivedBadMessage(
+        this,
+        guest_view::bad_message::GVMF_UNEXPECTED_MESSAGE_BEFORE_GVM_CREATION);
+    guest_view->Destroy(true);
+    return;
+  }
+  manager->AttachGuest(embedder_render_process_id, element_instance_id,
+                       guest_instance_id, attach_params);
+
+  if (!content::MimeHandlerViewMode::UsesCrossProcessFrame()) {
+    rfh->Send(new ExtensionsGuestViewMsg_CreateMimeHandlerViewGuestACK(
+         element_instance_id));
+     return;
+   }
+  auto* plugin_rfh = RenderFrameHost::FromID(embedder_render_process_id,
+                                             plugin_frame_routing_id);
+  if (!plugin_rfh) {
+    plugin_rfh = RenderFrameHost::FromPlaceholderId(embedder_render_process_id,
+                                                    plugin_frame_routing_id);
+  }
+  if (!plugin_rfh) {
+    guest_view->GetEmbedderFrame()->Send(
+        new ExtensionsGuestViewMsg_RetryCreatingMimeHandlerViewGuest(
+            element_instance_id));
+    guest_view->Destroy(true);
+    return;
+  }
+  if (guest_view->web_contents()->CanAttachToOuterContentsFrame(plugin_rfh)) {
+    guest_view->AttachToOuterWebContentsFrame(plugin_rfh, element_instance_id,
+                                              is_full_page_plugin);
+  } else {
+    frame_navigation_helpers_[element_instance_id] =
+        std::make_unique<FrameNavigationHelper>(
+            plugin_rfh, guest_view->guest_instance_id(), element_instance_id,
+            is_full_page_plugin, this);
+  }
+}
+"
+"    NavigateToAboutBlank() {
+  GURL about_blank(url::kAboutBlankURL);
+  content::NavigationController::LoadURLParams params(about_blank);
+  params.frame_tree_node_id = frame_tree_node_id_;
+  params.source_site_instance = parent_site_instance_;
+  params.is_renderer_initiated = true;
+  web_contents()->GetController().LoadURLWithParams(params);
+}
+"
+"void RemoveProcessIdFromGlobalMap(int32_t process_id) {
+  DCHECK_CURRENTLY_ON(BrowserThread::UI);
+  GetProcessIdToFilterMap()->erase(process_id);
+}
+"
+"void ExtensionsGuestViewMessageFilter::ResumeAttachOrDestroy(
+    int32_t element_instance_id,
+    int32_t plugin_frame_routing_id) {
+  auto it = frame_navigation_helpers_.find(element_instance_id);
+  if (it == frame_navigation_helpers_.end()) {
+    return;
+  }
+  auto* plugin_rfh = content::RenderFrameHost::FromID(render_process_id_,
+                                                      plugin_frame_routing_id);
+  auto* helper = it->second.get();
+  auto* guest_view = helper->GetGuestView();
+  if (!guest_view)
+    return;
+ 
+  if (plugin_rfh) {
+    DCHECK(
+        guest_view->web_contents()->CanAttachToOuterContentsFrame(plugin_rfh));
+    guest_view->AttachToOuterWebContentsFrame(plugin_rfh, element_instance_id,
+                                              helper->is_full_page_plugin());
+  } else {
+    guest_view->GetEmbedderFrame()->Send(
+        new ExtensionsGuestViewMsg_DestroyFrameContainer(element_instance_id));
+    guest_view->Destroy(true);
+  }
+  frame_navigation_helpers_.erase(element_instance_id);
+ }
+"
+"    ShouldCancelAndIgnore(NavigationHandle* handle) {
+  return handle->GetFrameTreeNodeId() == frame_tree_node_id_;
+}
+"
+"  SiteInstance* parent_site_instance() const {
+    return parent_site_instance_.get();
+  }
+"
+" ExtensionsGuestViewMessageFilter::~ExtensionsGuestViewMessageFilter() {
+   DCHECK_CURRENTLY_ON(BrowserThread::IO);
+  (*GetProcessIdToFilterMap())[render_process_id_] = nullptr;
+  base::PostTaskWithTraits(
+      FROM_HERE, BrowserThread::UI,
+      base::BindOnce(RemoveProcessIdFromGlobalMap, render_process_id_));
+ }
+"
+"DOMStorageContextWrapper::DOMStorageContextWrapper(
+     service_manager::Connector* connector,
+     const base::FilePath& profile_path,
+     const base::FilePath& local_partition_path,
+    storage::SpecialStoragePolicy* special_storage_policy) {
+  base::FilePath data_path;
+  if (!profile_path.empty())
+    data_path = profile_path.Append(local_partition_path);
+
+  scoped_refptr<base::SequencedTaskRunner> primary_sequence =
+      base::CreateSequencedTaskRunnerWithTraits(
+          {base::MayBlock(), base::TaskPriority::USER_BLOCKING,
+           base::TaskShutdownBehavior::BLOCK_SHUTDOWN});
+  scoped_refptr<base::SequencedTaskRunner> commit_sequence =
+      base::CreateSequencedTaskRunnerWithTraits(
+           {base::MayBlock(), base::TaskPriority::BEST_EFFORT,
+            base::TaskShutdownBehavior::BLOCK_SHUTDOWN});
+ 
+  legacy_localstorage_path_ =
+      data_path.empty() ? data_path
+                        : data_path.AppendASCII(kLocalStorageDirectory);
+  context_ = new DOMStorageContextImpl(
+      data_path.empty() ? data_path
+                        : data_path.AppendASCII(kSessionStorageDirectory),
+      special_storage_policy,
+      new DOMStorageWorkerPoolTaskRunner(std::move(primary_sequence),
+                                         std::move(commit_sequence)));
+  base::FilePath storage_dir;
+  if (!profile_path.empty())
+    storage_dir = local_partition_path.AppendASCII(kLocalStorageDirectory);
+  mojo_task_runner_ =
+       base::CreateSingleThreadTaskRunnerWithTraits({BrowserThread::IO});
+  mojo_state_ = new LocalStorageContextMojo(
+      mojo_task_runner_, connector, context_->task_runner(),
+      legacy_localstorage_path_, storage_dir, special_storage_policy);
+ 
+   if (base::FeatureList::IsEnabled(blink::features::kOnionSoupDOMStorage)) {
+    mojo_session_state_ = new SessionStorageContextMojo(
+        mojo_task_runner_, connector,
+ #if defined(OS_ANDROID)
+        SessionStorageContextMojo::BackingMode::kClearDiskStateOnOpen,
+#else
+        profile_path.empty()
+            ? SessionStorageContextMojo::BackingMode::kNoDisk
+            : SessionStorageContextMojo::BackingMode::kRestoreDiskState,
+#endif
+         local_partition_path, std::string(kSessionStorageDirectory));
+   }
+ 
+   memory_pressure_listener_.reset(new base::MemoryPressureListener(
+       base::BindRepeating(&DOMStorageContextWrapper::OnMemoryPressure,
+                           base::Unretained(this))));
+}
+"
+"void DOMStorageContextWrapper::OpenSessionStorage(
+    int process_id,
+    const std::string& namespace_id,
+    mojo::ReportBadMessageCallback bad_message_callback,
+     blink::mojom::SessionStorageNamespaceRequest request) {
+   if (!mojo_session_state_)
+     return;
+  mojo_task_runner_->PostTask(
+       FROM_HERE,
+       base::BindOnce(&SessionStorageContextMojo::OpenSessionStorage,
+                      base::Unretained(mojo_session_state_), process_id,
+                     namespace_id, std::move(bad_message_callback),
+                      std::move(request)));
+ }
+"
+" void DOMStorageContextWrapper::Shutdown() {
+  DCHECK(context_.get());
+  mojo_task_runner_->PostTask(
+      FROM_HERE, base::BindOnce(&LocalStorageContextMojo::ShutdownAndDelete,
+                                base::Unretained(mojo_state_)));
+  mojo_state_ = nullptr;
+   if (mojo_session_state_) {
+     mojo_task_runner_->PostTask(
+         FROM_HERE, base::BindOnce(&SessionStorageContextMojo::ShutdownAndDelete,
+                                   base::Unretained(mojo_session_state_)));
+     mojo_session_state_ = nullptr;
+   }
+   memory_pressure_listener_.reset();
+  context_->task_runner()->PostShutdownBlockingTask(
+      FROM_HERE, DOMStorageTaskRunner::PRIMARY_SEQUENCE,
+      base::BindOnce(&DOMStorageContextImpl::Shutdown, context_));
+ }
+"
+"std::unique_ptr<StoragePartitionImpl> StoragePartitionImpl::Create(
+    BrowserContext* context,
+    bool in_memory,
+    const base::FilePath& relative_partition_path,
+    const std::string& partition_domain) {
+  DCHECK(BrowserThread::CurrentlyOn(BrowserThread::UI) ||
+         !BrowserThread::IsThreadInitialized(BrowserThread::UI));
+
+  base::FilePath partition_path =
+      context->GetPath().Append(relative_partition_path);
+
+  std::unique_ptr<StoragePartitionImpl> partition =
+      base::WrapUnique(new StoragePartitionImpl(
+          context, partition_path, context->GetSpecialStoragePolicy()));
+
+  partition->is_in_memory_ = in_memory;
+  partition->relative_partition_path_ = relative_partition_path;
+
+  partition->quota_manager_ = new storage::QuotaManager(
+      in_memory, partition_path,
+      base::CreateSingleThreadTaskRunnerWithTraits({BrowserThread::IO}).get(),
+      context->GetSpecialStoragePolicy(),
+      base::BindRepeating(&StoragePartitionImpl::GetQuotaSettings,
+                          partition->weak_factory_.GetWeakPtr()));
+  scoped_refptr<storage::QuotaManagerProxy> quota_manager_proxy =
+      partition->quota_manager_->proxy();
+
+  partition->filesystem_context_ = CreateFileSystemContext(
+      context, partition_path, in_memory, quota_manager_proxy.get());
+
+  partition->database_tracker_ = base::MakeRefCounted<storage::DatabaseTracker>(
+       partition_path, in_memory, context->GetSpecialStoragePolicy(),
+       quota_manager_proxy.get());
+ 
+  partition->dom_storage_context_ = new DOMStorageContextWrapper(
+       BrowserContext::GetConnectorFor(context),
+       in_memory ? base::FilePath() : context->GetPath(),
+       relative_partition_path, context->GetSpecialStoragePolicy());
+
+  partition->lock_manager_ = new LockManager();
+
+  base::FilePath path = in_memory ? base::FilePath() : partition_path;
+  partition->indexed_db_context_ = new IndexedDBContextImpl(
+      path, context->GetSpecialStoragePolicy(), quota_manager_proxy,
+      indexed_db::GetDefaultLevelDBFactory());
+
+  partition->cache_storage_context_ = new CacheStorageContextImpl(context);
+  partition->cache_storage_context_->Init(path, quota_manager_proxy);
+
+  partition->service_worker_context_ = new ServiceWorkerContextWrapper(context);
+  partition->service_worker_context_->set_storage_partition(partition.get());
+
+  partition->appcache_service_ =
+      base::MakeRefCounted<ChromeAppCacheService>(quota_manager_proxy.get());
+
+  partition->shared_worker_service_ = std::make_unique<SharedWorkerServiceImpl>(
+      partition.get(), partition->service_worker_context_,
+      partition->appcache_service_);
+
+  partition->push_messaging_context_ =
+      new PushMessagingContext(context, partition->service_worker_context_);
+
+#if !defined(OS_ANDROID)
+  partition->host_zoom_level_context_ = new HostZoomLevelContext(
+      context->CreateZoomLevelDelegate(partition_path));
+#endif  // !defined(OS_ANDROID)
+
+  partition->platform_notification_context_ =
+      new PlatformNotificationContextImpl(path, context,
+                                          partition->service_worker_context_);
+  partition->platform_notification_context_->Initialize();
+
+  partition->background_fetch_context_ =
+      base::MakeRefCounted<BackgroundFetchContext>(
+          context, partition->service_worker_context_,
+          partition->cache_storage_context_, quota_manager_proxy);
+
+  partition->background_sync_context_ =
+      base::MakeRefCounted<BackgroundSyncContext>();
+  partition->background_sync_context_->Init(partition->service_worker_context_);
+
+  partition->payment_app_context_ = new PaymentAppContextImpl();
+  partition->payment_app_context_->Init(partition->service_worker_context_);
+
+  partition->broadcast_channel_provider_ = new BroadcastChannelProvider();
+
+  partition->bluetooth_allowed_devices_map_ = new BluetoothAllowedDevicesMap();
+
+  scoped_refptr<ChromeBlobStorageContext> blob_context =
+      ChromeBlobStorageContext::GetFor(context);
+
+  partition->url_loader_factory_getter_ = new URLLoaderFactoryGetter();
+  partition->url_loader_factory_getter_->Initialize(partition.get());
+
+  partition->service_worker_context_->Init(
+      path, quota_manager_proxy.get(), context->GetSpecialStoragePolicy(),
+      blob_context.get(), partition->url_loader_factory_getter_.get());
+
+  partition->blob_registry_ =
+      BlobRegistryWrapper::Create(blob_context, partition->filesystem_context_);
+
+  partition->appcache_service_->set_url_loader_factory_getter(
+      partition->url_loader_factory_getter_.get());
+
+  partition->prefetch_url_loader_service_ =
+      base::MakeRefCounted<PrefetchURLLoaderService>();
+
+  partition->cookie_store_context_ = base::MakeRefCounted<CookieStoreContext>();
+  partition->cookie_store_context_->Initialize(
+      partition->service_worker_context_, base::DoNothing());
+
+  if (base::FeatureList::IsEnabled(net::features::kIsolatedCodeCache)) {
+    GeneratedCodeCacheSettings settings =
+        GetContentClient()->browser()->GetGeneratedCodeCacheSettings(context);
+
+    if (!in_memory && settings.enabled()) {
+      partition->generated_code_cache_context_ =
+          base::MakeRefCounted<GeneratedCodeCacheContext>();
+
+      base::FilePath code_cache_path;
+      if (partition_domain.empty()) {
+        code_cache_path = settings.path().AppendASCII(""Code Cache"");
+      } else {
+        code_cache_path = settings.path()
+                              .Append(relative_partition_path)
+                              .AppendASCII(""Code Cache"");
+      }
+      DCHECK_GE(settings.size_in_bytes(), 0);
+      partition->GetGeneratedCodeCacheContext()->Initialize(
+          code_cache_path, settings.size_in_bytes());
+    }
+  }
+
+  return partition;
+}
+"
+"void Document::InitContentSecurityPolicy(
+    ContentSecurityPolicy* csp,
+    const ContentSecurityPolicy* policy_to_inherit,
+    const ContentSecurityPolicy* previous_document_csp) {
+   SetContentSecurityPolicy(csp ? csp : ContentSecurityPolicy::Create());
+ 
+   GetContentSecurityPolicy()->BindToExecutionContext(this);
+ 
+  if (policy_to_inherit) {
+     GetContentSecurityPolicy()->CopyStateFrom(policy_to_inherit);
+  } else {
+    if (frame_) {
+       Frame* inherit_from = frame_->Tree().Parent()
+                                 ? frame_->Tree().Parent()
+                                 : frame_->Client()->Opener();
+       if (inherit_from && frame_ != inherit_from) {
+         DCHECK(inherit_from->GetSecurityContext() &&
+                inherit_from->GetSecurityContext()->GetContentSecurityPolicy());
+        policy_to_inherit =
+            inherit_from->GetSecurityContext()->GetContentSecurityPolicy();
+       }
+     }
+    if (!policy_to_inherit)
+      policy_to_inherit = previous_document_csp;
+    if (policy_to_inherit &&
+        (url_.IsEmpty() || url_.ProtocolIsAbout() || url_.ProtocolIsData() ||
+         url_.ProtocolIs(""blob"") || url_.ProtocolIs(""filesystem"")))
+      GetContentSecurityPolicy()->CopyStateFrom(policy_to_inherit);
+  }
+  if (policy_to_inherit && IsPluginDocument())
+    GetContentSecurityPolicy()->CopyPluginTypesFrom(policy_to_inherit);
+ }
+"
+"void Document::InitSecurityContext(const DocumentInit& initializer) {
+  DCHECK(!GetSecurityOrigin());
+
+  if (!initializer.HasSecurityContext()) {
+    cookie_url_ = KURL(g_empty_string);
+    SetSecurityOrigin(SecurityOrigin::CreateUniqueOpaque());
+    InitContentSecurityPolicy();
+    ApplyFeaturePolicy({});
+    return;
+  }
+
+  SandboxFlags sandbox_flags = initializer.GetSandboxFlags();
+  if (fetcher_->Archive()) {
+    sandbox_flags |=
+        kSandboxAll &
+        ~(kSandboxPopups | kSandboxPropagatesToAuxiliaryBrowsingContexts);
+  }
+  EnforceSandboxFlags(sandbox_flags);
+  SetInsecureRequestPolicy(initializer.GetInsecureRequestPolicy());
+  if (initializer.InsecureNavigationsToUpgrade()) {
+    for (auto to_upgrade : *initializer.InsecureNavigationsToUpgrade())
+       AddInsecureNavigationUpgrade(to_upgrade);
+   }
+ 
+  const ContentSecurityPolicy* policy_to_inherit = nullptr;
+ 
+   if (IsSandboxed(kSandboxOrigin)) {
+     cookie_url_ = url_;
+    scoped_refptr<SecurityOrigin> security_origin =
+        SecurityOrigin::CreateUniqueOpaque();
+    Document* owner = initializer.OwnerDocument();
+    if (owner) {
+      if (owner->GetSecurityOrigin()->IsPotentiallyTrustworthy())
+         security_origin->SetOpaqueOriginIsPotentiallyTrustworthy(true);
+       if (owner->GetSecurityOrigin()->CanLoadLocalResources())
+         security_origin->GrantLoadLocalResources();
+      policy_to_inherit = owner->GetContentSecurityPolicy();
+     }
+     SetSecurityOrigin(std::move(security_origin));
+   } else if (Document* owner = initializer.OwnerDocument()) {
+     cookie_url_ = owner->CookieURL();
+     SetSecurityOrigin(owner->GetMutableSecurityOrigin());
+    policy_to_inherit = owner->GetContentSecurityPolicy();
+   } else {
+     cookie_url_ = url_;
+     SetSecurityOrigin(SecurityOrigin::Create(url_));
+  }
+
+  if (initializer.IsHostedInReservedIPRange()) {
+    SetAddressSpace(GetSecurityOrigin()->IsLocalhost()
+                        ? mojom::IPAddressSpace::kLocal
+                        : mojom::IPAddressSpace::kPrivate);
+  } else if (GetSecurityOrigin()->IsLocal()) {
+    SetAddressSpace(mojom::IPAddressSpace::kLocal);
+  } else {
+    SetAddressSpace(mojom::IPAddressSpace::kPublic);
+  }
+
+  if (ImportsController()) {
+     SetContentSecurityPolicy(
+         ImportsController()->Master()->GetContentSecurityPolicy());
+   } else {
+    InitContentSecurityPolicy(nullptr, policy_to_inherit,
+                              initializer.PreviousDocumentCSP());
+   }
+ 
+   if (Settings* settings = initializer.GetSettings()) {
+    if (!settings->GetWebSecurityEnabled()) {
+      GetMutableSecurityOrigin()->GrantUniversalAccess();
+    } else if (GetSecurityOrigin()->IsLocal()) {
+      if (settings->GetAllowUniversalAccessFromFileURLs()) {
+        GetMutableSecurityOrigin()->GrantUniversalAccess();
+      } else if (!settings->GetAllowFileAccessFromFileURLs()) {
+        GetMutableSecurityOrigin()->BlockLocalAccessFromLocalOrigin();
+      }
+    }
+  }
+
+  if (GetSecurityOrigin()->IsOpaque() &&
+      SecurityOrigin::Create(url_)->IsPotentiallyTrustworthy())
+    GetMutableSecurityOrigin()->SetOpaqueOriginIsPotentiallyTrustworthy(true);
+
+  ApplyFeaturePolicy({});
+
+  InitSecureContextState();
+}
+"
+"DocumentInit& DocumentInit::WithPreviousDocumentCSP(
+    const ContentSecurityPolicy* previous_csp) {
+  DCHECK(!previous_csp_);
+  previous_csp_ = previous_csp;
+  return *this;
+}
+"
+"bool ContentSecurityPolicy::AllowPluginTypeForDocument(
+    const Document& document,
+    const String& type,
+    const String& type_attribute,
+    const KURL& url,
+    SecurityViolationReportingPolicy reporting_policy) const {
+  if (document.GetContentSecurityPolicy() &&
+      !document.GetContentSecurityPolicy()->AllowPluginType(
+           type, type_attribute, url, reporting_policy))
+     return false;
+ 
+  LocalFrame* frame = document.GetFrame();
+  if (frame && frame->Tree().Parent() && document.IsPluginDocument()) {
+    ContentSecurityPolicy* parent_csp = frame->Tree()
+                                            .Parent()
+                                            ->GetSecurityContext()
+                                            ->GetContentSecurityPolicy();
+    if (parent_csp && !parent_csp->AllowPluginType(type, type_attribute, url,
+                                                   reporting_policy))
+      return false;
+  }
+   return true;
+ }
+"
+"void DocumentLoader::DidInstallNewDocument(
+    Document* document,
+    const ContentSecurityPolicy* previous_csp) {
+   document->SetReadyState(Document::kLoading);
+   if (content_security_policy_) {
+    document->InitContentSecurityPolicy(content_security_policy_.Release(),
+                                        nullptr, previous_csp);
+   }
+ 
+   if (history_item_ && IsBackForwardLoadType(load_type_))
+    document->SetStateForNewFormElements(history_item_->GetDocumentState());
+
+  DCHECK(document->GetFrame());
+  document->GetFrame()->GetClientHintsPreferences().UpdateFrom(
+      client_hints_preferences_);
+
+  Settings* settings = document->GetSettings();
+  fetcher_->SetImagesEnabled(settings->GetImagesEnabled());
+  fetcher_->SetAutoLoadImages(settings->GetLoadsImagesAutomatically());
+
+  const AtomicString& dns_prefetch_control =
+      response_.HttpHeaderField(http_names::kXDNSPrefetchControl);
+  if (!dns_prefetch_control.IsEmpty())
+    document->ParseDNSPrefetchControlHeader(dns_prefetch_control);
+
+  String header_content_language =
+      response_.HttpHeaderField(http_names::kContentLanguage);
+  if (!header_content_language.IsEmpty()) {
+    wtf_size_t comma_index = header_content_language.find(',');
+    header_content_language.Truncate(comma_index);
+    header_content_language =
+        header_content_language.StripWhiteSpace(IsHTMLSpace<UChar>);
+    if (!header_content_language.IsEmpty())
+      document->SetContentLanguage(AtomicString(header_content_language));
+  }
+
+  String referrer_policy_header =
+      response_.HttpHeaderField(http_names::kReferrerPolicy);
+  if (!referrer_policy_header.IsNull()) {
+    UseCounter::Count(*document, WebFeature::kReferrerPolicyHeader);
+    document->ParseAndSetReferrerPolicy(referrer_policy_header);
+  }
+
+  if (response_.IsSignedExchangeInnerResponse())
+    UseCounter::Count(*document, WebFeature::kSignedExchangeInnerResponse);
+
+  GetLocalFrameClient().DidCreateNewDocument();
+}
+"
+"void DocumentLoader::InstallNewDocument(
+    const KURL& url,
+    Document* owner_document,
+    WebGlobalObjectReusePolicy global_object_reuse_policy,
+    const AtomicString& mime_type,
+    const AtomicString& encoding,
+    InstallNewDocumentReason reason,
+    ParserSynchronizationPolicy parsing_policy,
+    const KURL& overriding_url) {
+  DCHECK(!frame_->GetDocument() || !frame_->GetDocument()->IsActive());
+  DCHECK_EQ(frame_->Tree().ChildCount(), 0u);
+  if (GetFrameLoader().StateMachine()->IsDisplayingInitialEmptyDocument()) {
+    GetFrameLoader().StateMachine()->AdvanceTo(
+        FrameLoaderStateMachine::kCommittedFirstRealLoad);
+   }
+ 
+   const SecurityOrigin* previous_security_origin = nullptr;
+  const ContentSecurityPolicy* previous_csp = nullptr;
+   if (frame_->GetDocument()) {
+     previous_security_origin = frame_->GetDocument()->GetSecurityOrigin();
+    previous_csp = frame_->GetDocument()->GetContentSecurityPolicy();
+   }
+ 
+  if (global_object_reuse_policy != WebGlobalObjectReusePolicy::kUseExisting)
+    frame_->SetDOMWindow(LocalDOMWindow::Create(*frame_));
+
+  if (reason == InstallNewDocumentReason::kNavigation)
+    WillCommitNavigation();
+
+  Document* document = frame_->DomWindow()->InstallNewDocument(
+      mime_type,
+      DocumentInit::Create()
+           .WithDocumentLoader(this)
+           .WithURL(url)
+           .WithOwnerDocument(owner_document)
+          .WithNewRegistrationContext()
+          .WithPreviousDocumentCSP(previous_csp),
+       false);
+ 
+  if (frame_->IsMainFrame())
+    frame_->ClearActivation();
+
+  if (frame_->HasReceivedUserGestureBeforeNavigation() !=
+      had_sticky_activation_) {
+    frame_->SetDocumentHasReceivedUserGestureBeforeNavigation(
+        had_sticky_activation_);
+    GetLocalFrameClient().SetHasReceivedUserGestureBeforeNavigation(
+        had_sticky_activation_);
+  }
+
+  if (ShouldClearWindowName(*frame_, previous_security_origin, *document)) {
+    frame_->Tree().ExperimentalSetNulledName();
+  }
+ 
+   if (!overriding_url.IsEmpty())
+     document->SetBaseURLOverride(overriding_url);
+  DidInstallNewDocument(document, previous_csp);
+ 
+  if (reason == InstallNewDocumentReason::kNavigation)
+    DidCommitNavigation(global_object_reuse_policy);
+
+  if (GetFrameLoader().StateMachine()->CommittedFirstRealDocumentLoad()) {
+    if (document->GetSettings()
+            ->GetForceTouchEventFeatureDetectionForInspector()) {
+      OriginTrialContext::FromOrCreate(document)->AddFeature(
+          ""ForceTouchEventFeatureDetectionForInspector"");
+    }
+    OriginTrialContext::AddTokensFromHeader(
+        document, response_.HttpHeaderField(http_names::kOriginTrial));
+  }
+  bool stale_while_revalidate_enabled =
+      origin_trials::StaleWhileRevalidateEnabled(document);
+  fetcher_->SetStaleWhileRevalidateEnabled(stale_while_revalidate_enabled);
+
+  if (stale_while_revalidate_enabled &&
+      !RuntimeEnabledFeatures::StaleWhileRevalidateEnabledByRuntimeFlag())
+    UseCounter::Count(frame_, WebFeature::kStaleWhileRevalidateEnabled);
+
+  parser_ = document->OpenForNavigation(parsing_policy, mime_type, encoding);
+
+  ScriptableDocumentParser* scriptable_parser =
+      parser_->AsScriptableDocumentParser();
+  if (scriptable_parser && GetResource()) {
+    scriptable_parser->SetInlineScriptCacheHandler(
+        ToRawResource(GetResource())->InlineScriptCacheHandler());
+  }
+
+  WTF::String feature_policy(
+      response_.HttpHeaderField(http_names::kFeaturePolicy));
+  MergeFeaturesFromOriginPolicy(feature_policy, request_.GetOriginPolicy());
+  document->ApplyFeaturePolicyFromHeader(feature_policy);
+
+  GetFrameLoader().DispatchDidClearDocumentOfWindowObject();
+}
+"
+" std::wstring GetSwitchValueFromCommandLine(const std::wstring& command_line,
+                                            const std::wstring& switch_name) {
+   assert(!command_line.empty());
+   assert(!switch_name.empty());
+ 
+   std::vector<std::wstring> as_array = TokenizeCommandLineToArray(command_line);
+   std::wstring switch_with_equal = L""--"" + switch_name + L""="";
+  for (size_t i = 1; i < as_array.size(); ++i) {
+    const std::wstring& arg = as_array[i];
+     if (arg.compare(0, switch_with_equal.size(), switch_with_equal) == 0)
+       return arg.substr(switch_with_equal.size());
+   }
+
+  return std::wstring();
+}
+"
+"DOMArrayBuffer* FileReaderLoader::ArrayBufferResult() {
+  DCHECK_EQ(read_type_, kReadAsArrayBuffer);
+  if (array_buffer_result_)
+    return array_buffer_result_;
+
+   if (!raw_data_ || error_code_ != FileErrorCode::kOK)
+     return nullptr;
+ 
+  DOMArrayBuffer* result = DOMArrayBuffer::Create(raw_data_->ToArrayBuffer());
+  if (finished_loading_) {
+    array_buffer_result_ = result;
+    AdjustReportedMemoryUsageToV8(
+        -1 * static_cast<int64_t>(raw_data_->ByteLength()));
+    raw_data_.reset();
+   }
+  return result;
+ }
+"
+"void ConfigureQuicParams(base::StringPiece quic_trial_group,
+                         const VariationParameters& quic_trial_params,
+                         bool is_quic_force_disabled,
+                         bool is_quic_force_enabled,
+                         const std::string& quic_user_agent_id,
+                         net::HttpNetworkSession::Params* params) {
+  params->enable_quic =
+      ShouldEnableQuic(quic_trial_group, quic_trial_params,
+                       is_quic_force_disabled, is_quic_force_enabled);
+  params->mark_quic_broken_when_network_blackholes =
+      ShouldMarkQuicBrokenWhenNetworkBlackholes(quic_trial_params);
+
+  params->enable_server_push_cancellation =
+      ShouldEnableServerPushCancelation(quic_trial_params);
+
+  params->retry_without_alt_svc_on_quic_errors =
+      ShouldRetryWithoutAltSvcOnQuicErrors(quic_trial_params);
+
+  params->support_ietf_format_quic_altsvc =
+      ShouldSupportIetfFormatQuicAltSvc(quic_trial_params);
+
+   if (params->enable_quic) {
+     params->enable_quic_proxies_for_https_urls =
+         ShouldEnableQuicProxiesForHttpsUrls(quic_trial_params);
+    params->enable_quic_proxies_for_https_urls = false;
+     params->quic_connection_options =
+         GetQuicConnectionOptions(quic_trial_params);
+     params->quic_client_connection_options =
+        GetQuicClientConnectionOptions(quic_trial_params);
+    params->quic_close_sessions_on_ip_change =
+        ShouldQuicCloseSessionsOnIpChange(quic_trial_params);
+    params->quic_goaway_sessions_on_ip_change =
+        ShouldQuicGoAwaySessionsOnIpChange(quic_trial_params);
+    int idle_connection_timeout_seconds =
+        GetQuicIdleConnectionTimeoutSeconds(quic_trial_params);
+    if (idle_connection_timeout_seconds != 0) {
+      params->quic_idle_connection_timeout_seconds =
+          idle_connection_timeout_seconds;
+    }
+    int reduced_ping_timeout_seconds =
+        GetQuicReducedPingTimeoutSeconds(quic_trial_params);
+    if (reduced_ping_timeout_seconds > 0 &&
+        reduced_ping_timeout_seconds < quic::kPingTimeoutSecs) {
+      params->quic_reduced_ping_timeout_seconds = reduced_ping_timeout_seconds;
+    }
+    int max_time_before_crypto_handshake_seconds =
+        GetQuicMaxTimeBeforeCryptoHandshakeSeconds(quic_trial_params);
+    if (max_time_before_crypto_handshake_seconds > 0) {
+      params->quic_max_time_before_crypto_handshake_seconds =
+          max_time_before_crypto_handshake_seconds;
+    }
+    int max_idle_time_before_crypto_handshake_seconds =
+        GetQuicMaxIdleTimeBeforeCryptoHandshakeSeconds(quic_trial_params);
+    if (max_idle_time_before_crypto_handshake_seconds > 0) {
+      params->quic_max_idle_time_before_crypto_handshake_seconds =
+          max_idle_time_before_crypto_handshake_seconds;
+    }
+    params->quic_race_cert_verification =
+        ShouldQuicRaceCertVerification(quic_trial_params);
+    params->quic_estimate_initial_rtt =
+        ShouldQuicEstimateInitialRtt(quic_trial_params);
+    params->quic_headers_include_h2_stream_dependency =
+        ShouldQuicHeadersIncludeH2StreamDependencies(quic_trial_params);
+    params->quic_migrate_sessions_on_network_change_v2 =
+        ShouldQuicMigrateSessionsOnNetworkChangeV2(quic_trial_params);
+    params->quic_migrate_sessions_early_v2 =
+        ShouldQuicMigrateSessionsEarlyV2(quic_trial_params);
+    params->quic_retry_on_alternate_network_before_handshake =
+        ShouldQuicRetryOnAlternateNetworkBeforeHandshake(quic_trial_params);
+    params->quic_go_away_on_path_degrading =
+        ShouldQuicGoawayOnPathDegrading(quic_trial_params);
+    params->quic_race_stale_dns_on_connection =
+        ShouldQuicRaceStaleDNSOnConnection(quic_trial_params);
+    int max_time_on_non_default_network_seconds =
+        GetQuicMaxTimeOnNonDefaultNetworkSeconds(quic_trial_params);
+    if (max_time_on_non_default_network_seconds > 0) {
+      params->quic_max_time_on_non_default_network =
+          base::TimeDelta::FromSeconds(max_time_on_non_default_network_seconds);
+    }
+    int max_migrations_to_non_default_network_on_write_error =
+        GetQuicMaxNumMigrationsToNonDefaultNetworkOnWriteError(
+            quic_trial_params);
+    if (max_migrations_to_non_default_network_on_write_error > 0) {
+      params->quic_max_migrations_to_non_default_network_on_write_error =
+          max_migrations_to_non_default_network_on_write_error;
+    }
+    int max_migrations_to_non_default_network_on_path_degrading =
+        GetQuicMaxNumMigrationsToNonDefaultNetworkOnPathDegrading(
+            quic_trial_params);
+    if (max_migrations_to_non_default_network_on_path_degrading > 0) {
+      params->quic_max_migrations_to_non_default_network_on_path_degrading =
+          max_migrations_to_non_default_network_on_path_degrading;
+    }
+    params->quic_allow_server_migration =
+        ShouldQuicAllowServerMigration(quic_trial_params);
+    params->quic_host_whitelist = GetQuicHostWhitelist(quic_trial_params);
+  }
+
+  size_t max_packet_length = GetQuicMaxPacketLength(quic_trial_params);
+  if (max_packet_length != 0) {
+    params->quic_max_packet_length = max_packet_length;
+  }
+
+  params->quic_user_agent_id = quic_user_agent_id;
+
+  quic::QuicTransportVersionVector supported_versions =
+      GetQuicVersions(quic_trial_params);
+  if (!supported_versions.empty())
+    params->quic_supported_versions = supported_versions;
+}
+"
+" bool SVGElement::HasSVGParent() const {
+  return ParentOrShadowHostElement() &&
+         ParentOrShadowHostElement()->IsSVGElement();
+ }
+"
+" ImageBitmapFactories::ImageBitmapLoader::ImageBitmapLoader(
+     ImageBitmapFactories& factory,
+     base::Optional<IntRect> crop_rect,
+     ScriptState* script_state,
+     const ImageBitmapOptions* options)
+    : loader_(
+           FileReaderLoader::Create(FileReaderLoader::kReadAsArrayBuffer, this)),
+       factory_(&factory),
+       resolver_(ScriptPromiseResolver::Create(script_state)),
+       crop_rect_(crop_rect),
+       options_(options) {}
+"
+"void ImageBitmapFactories::ImageBitmapLoader::LoadBlobAsync(
+    Blob* blob) {
+   loader_->Start(blob->GetBlobDataHandle());
+ }
+"
+"void ImageBitmapFactories::Trace(blink::Visitor* visitor) {
+  visitor->Trace(pending_loaders_);
+  Supplement<LocalDOMWindow>::Trace(visitor);
+  Supplement<WorkerGlobalScope>::Trace(visitor);
+ }
+"
+"void RenderFrameImpl::OnSelectPopupMenuItem(int selected_index) {
+  if (external_popup_menu_ == NULL)
+     return;
+ 
+   blink::WebScopedUserGesture gesture(frame_);
+  external_popup_menu_->DidSelectItem(selected_index);
+  external_popup_menu_.reset();
+ }
+"
+" void RenderFrameImpl::OnSelectPopupMenuItems(
+    bool canceled,
+    const std::vector<int>& selected_indices) {
+  if (!external_popup_menu_)
+     return;
+ 
+   blink::WebScopedUserGesture gesture(frame_);
+  external_popup_menu_->DidSelectItems(canceled, selected_indices);
+  external_popup_menu_.reset();
+ }
+"
+"   void ProcessStateChangesPlanB(WebRtcSetDescriptionObserver::States states) {
+     DCHECK_EQ(sdp_semantics_, webrtc::SdpSemantics::kPlanB);
+     std::vector<RTCRtpReceiver*> removed_receivers;
+    for (auto it = handler_->rtp_receivers_.begin();
+         it != handler_->rtp_receivers_.end(); ++it) {
+      if (ReceiverWasRemoved(*(*it), states.transceiver_states))
+        removed_receivers.push_back(it->get());
+    }
+ 
+     for (auto& transceiver_state : states.transceiver_states) {
+      if (ReceiverWasAdded(transceiver_state)) {
+         handler_->OnAddReceiverPlanB(transceiver_state.MoveReceiverState());
+       }
+     }
+     for (auto* removed_receiver : removed_receivers) {
+      handler_->OnRemoveReceiverPlanB(RTCRtpReceiver::getId(
+          removed_receiver->state().webrtc_receiver().get()));
+     }
+   }
+"
+"   void ProcessStateChangesUnifiedPlan(
+       WebRtcSetDescriptionObserver::States states) {
+     DCHECK_EQ(sdp_semantics_, webrtc::SdpSemantics::kUnifiedPlan);
+    handler_->OnModifyTransceivers(
+        std::move(states.transceiver_states),
+        action_ == PeerConnectionTracker::ACTION_SET_REMOTE_DESCRIPTION);
+   }
+"
+"void PaymentRequest::AreRequestedMethodsSupportedCallback(
+    bool methods_supported) {
+  if (methods_supported) {
+    if (SatisfiesSkipUIConstraints()) {
+      skipped_payment_request_ui_ = true;
+      Pay();
+    }
+  } else {
+    journey_logger_.SetNotShown(
+        JourneyLogger::NOT_SHOWN_REASON_NO_SUPPORTED_PAYMENT_METHOD);
+    client_->OnError(mojom::PaymentErrorReason::NOT_SUPPORTED);
+    if (observer_for_testing_)
+      observer_for_testing_->OnNotSupportedError();
+     OnConnectionTerminated();
+   }
+}
+"
+" void PaymentRequest::Complete(mojom::PaymentComplete result) {
+  if (!client_.is_bound())
+     return;
+ 
+  if (result == mojom::PaymentComplete::FAIL) {
+    delegate_->ShowErrorMessage();
+  } else {
+    DCHECK(!has_recorded_completion_);
+    journey_logger_.SetCompleted();
+    has_recorded_completion_ = true;
+
+    delegate_->GetPrefService()->SetBoolean(kPaymentsFirstTransactionCompleted,
+                                            true);
+    client_->OnComplete();
+    state_->RecordUseStats();
+  }
+ }
+"
+"void PaymentRequest::Init(mojom::PaymentRequestClientPtr client,
+                          std::vector<mojom::PaymentMethodDataPtr> method_data,
+                           mojom::PaymentDetailsPtr details,
+                           mojom::PaymentOptionsPtr options) {
+   DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
+   client_ = std::move(client);
+ 
+   const GURL last_committed_url = delegate_->GetLastCommittedURL();
+   if (!OriginSecurityChecker::IsOriginSecure(last_committed_url)) {
+    LOG(ERROR) << ""Not in a secure origin"";
+     OnConnectionTerminated();
+     return;
+   }
+
+  bool allowed_origin =
+       OriginSecurityChecker::IsSchemeCryptographic(last_committed_url) ||
+       OriginSecurityChecker::IsOriginLocalhostOrFile(last_committed_url);
+   if (!allowed_origin) {
+    LOG(ERROR) << ""Only localhost, file://, and cryptographic scheme origins ""
+                  ""allowed"";
+   }
+ 
+   bool invalid_ssl =
+       OriginSecurityChecker::IsSchemeCryptographic(last_committed_url) &&
+       !delegate_->IsSslCertificateValid();
+  if (invalid_ssl)
+    LOG(ERROR) << ""SSL certificate is not valid"";
+ 
+   if (!allowed_origin || invalid_ssl) {
+     return;
+   }
+ 
+   std::string error;
+   if (!ValidatePaymentDetails(ConvertPaymentDetails(details), &error)) {
+    LOG(ERROR) << error;
+     OnConnectionTerminated();
+     return;
+   }
+ 
+   if (!details->total) {
+    LOG(ERROR) << ""Missing total"";
+     OnConnectionTerminated();
+     return;
+   }
+
+  spec_ = std::make_unique<PaymentRequestSpec>(
+      std::move(options), std::move(details), std::move(method_data), this,
+      delegate_->GetApplicationLocale());
+  state_ = std::make_unique<PaymentRequestState>(
+      web_contents_, top_level_origin_, frame_origin_, spec_.get(), this,
+      delegate_->GetApplicationLocale(), delegate_->GetPersonalDataManager(),
+      delegate_.get(), &journey_logger_);
+
+  journey_logger_.SetRequestedInformation(
+      spec_->request_shipping(), spec_->request_payer_email(),
+      spec_->request_payer_phone(), spec_->request_payer_name());
+
+  GURL google_pay_url(kGooglePayMethodName);
+  GURL android_pay_url(kAndroidPayMethodName);
+  auto non_google_it =
+      std::find_if(spec_->url_payment_method_identifiers().begin(),
+                   spec_->url_payment_method_identifiers().end(),
+                   [google_pay_url, android_pay_url](const GURL& url) {
+                     return url != google_pay_url && url != android_pay_url;
+                   });
+  journey_logger_.SetRequestedPaymentMethodTypes(
+      /*requested_basic_card=*/!spec_->supported_card_networks().empty(),
+      /*requested_method_google=*/
+      base::ContainsValue(spec_->url_payment_method_identifiers(),
+                          google_pay_url) ||
+          base::ContainsValue(spec_->url_payment_method_identifiers(),
+                              android_pay_url),
+      /*requested_method_other=*/non_google_it !=
+          spec_->url_payment_method_identifiers().end());
+ }
+"
+" void PaymentRequest::Retry(mojom::PaymentValidationErrorsPtr errors) {
+  if (!client_.is_bound() || !binding_.is_bound()) {
+    DLOG(ERROR) << ""Attempted Retry(), but binding(s) missing."";
+     OnConnectionTerminated();
+     return;
+   }
+ 
+  if (!display_handle_) {
+    DLOG(ERROR) << ""Attempted Retry(), but display_handle_ is nullptr."";
+     OnConnectionTerminated();
+     return;
+   }
+ 
+   std::string error;
+   if (!PaymentsValidators::IsValidPaymentValidationErrorsFormat(errors,
+                                                                 &error)) {
+    DLOG(ERROR) << error;
+     client_->OnError(mojom::PaymentErrorReason::USER_CANCEL);
+     OnConnectionTerminated();
+     return;
+  }
+
+  spec()->Retry(std::move(errors));
+   display_handle_->Retry();
+ }
+"
+"bool PaymentRequest::SatisfiesSkipUIConstraints() const {
+  return base::FeatureList::IsEnabled(features::kWebPaymentsSingleAppUiSkip) &&
+         base::FeatureList::IsEnabled(::features::kServiceWorkerPaymentApps) &&
+         is_show_user_gesture_ && state()->is_get_all_instruments_finished() &&
+         state()->available_instruments().size() == 1 &&
+         spec()->stringified_method_data().size() == 1 &&
+         !spec()->request_shipping() && !spec()->request_payer_name() &&
+         !spec()->request_payer_phone() &&
+         !spec()->request_payer_email()
+         && spec()->url_payment_method_identifiers().size() == 1;
+}
+"
+" void PaymentRequest::Show(bool is_user_gesture) {
+  if (!client_.is_bound() || !binding_.is_bound()) {
+    LOG(ERROR) << ""Attempted Show(), but binding(s) missing."";
+     OnConnectionTerminated();
+     return;
+   }
+ 
+   display_handle_ = display_manager_->TryShow(delegate_.get());
+   if (!display_handle_) {
+    LOG(ERROR) << ""A PaymentRequest UI is already showing"";
+     journey_logger_.SetNotShown(
+         JourneyLogger::NOT_SHOWN_REASON_CONCURRENT_REQUESTS);
+     client_->OnError(mojom::PaymentErrorReason::ALREADY_SHOWING);
+    OnConnectionTerminated();
+    return;
+   }
+ 
+   if (!delegate_->IsBrowserWindowActive()) {
+    LOG(ERROR) << ""Cannot show PaymentRequest UI in a background tab"";
+     journey_logger_.SetNotShown(JourneyLogger::NOT_SHOWN_REASON_OTHER);
+     client_->OnError(mojom::PaymentErrorReason::USER_CANCEL);
+     OnConnectionTerminated();
+     return;
+   }
+ 
+   if (!state_) {
+     AreRequestedMethodsSupportedCallback(false);
+     return;
+   }
+
+  is_show_user_gesture_ = is_user_gesture;
+
+  display_handle_->Show(this);
+
+  state_->AreRequestedMethodsSupported(
+      base::BindOnce(&PaymentRequest::AreRequestedMethodsSupportedCallback,
+                     weak_ptr_factory_.GetWeakPtr()));
+ }
+"
+"void PaymentRequest::UpdateWith(mojom::PaymentDetailsPtr details) {
+   std::string error;
+   if (!ValidatePaymentDetails(ConvertPaymentDetails(details), &error)) {
+    LOG(ERROR) << error;
+     OnConnectionTerminated();
+     return;
+   }
+ 
+   if (details->shipping_address_errors &&
+       !PaymentsValidators::IsValidAddressErrorsFormat(
+           details->shipping_address_errors, &error)) {
+    DLOG(ERROR) << error;
+     OnConnectionTerminated();
+     return;
+   }
+ 
+   if (!details->total) {
+    LOG(ERROR) << ""Missing total"";
+     OnConnectionTerminated();
+     return;
+   }
+
+  spec_->UpdateWith(std::move(details));
+ }
+"
+"void RenderFrameHostImpl::CreateMediaStreamDispatcherHost(
+    MediaStreamManager* media_stream_manager,
+    mojom::MediaStreamDispatcherHostRequest request) {
+  DCHECK_CURRENTLY_ON(BrowserThread::IO);
+  if (!media_stream_dispatcher_host_) {
+    media_stream_dispatcher_host_.reset(new MediaStreamDispatcherHost(
+        GetProcess()->GetID(), GetRoutingID(), media_stream_manager));
+  }
+  media_stream_dispatcher_host_->BindRequest(std::move(request));
+}
+"
+"void RenderFrameHostImpl::RegisterMojoInterfaces() {
+#if !defined(OS_ANDROID)
+  registry_->AddInterface(base::Bind(&InstalledAppProviderImplDefault::Create));
+#endif  // !defined(OS_ANDROID)
+
+  PermissionControllerImpl* permission_controller =
+      PermissionControllerImpl::FromBrowserContext(
+          GetProcess()->GetBrowserContext());
+  if (delegate_) {
+    auto* geolocation_context = delegate_->GetGeolocationContext();
+    if (geolocation_context) {
+      geolocation_service_.reset(new GeolocationServiceImpl(
+          geolocation_context, permission_controller, this));
+      registry_->AddInterface(
+          base::Bind(&GeolocationServiceImpl::Bind,
+                     base::Unretained(geolocation_service_.get())));
+    }
+  }
+
+  registry_->AddInterface<device::mojom::WakeLock>(base::Bind(
+      &RenderFrameHostImpl::BindWakeLockRequest, base::Unretained(this)));
+
+#if defined(OS_ANDROID)
+  if (base::FeatureList::IsEnabled(features::kWebNfc)) {
+    registry_->AddInterface<device::mojom::NFC>(base::Bind(
+        &RenderFrameHostImpl::BindNFCRequest, base::Unretained(this)));
+  }
+#endif
+
+  if (!permission_service_context_)
+    permission_service_context_.reset(new PermissionServiceContext(this));
+
+  registry_->AddInterface(
+      base::Bind(&PermissionServiceContext::CreateService,
+                 base::Unretained(permission_service_context_.get())));
+
+  registry_->AddInterface(
+      base::Bind(&RenderFrameHostImpl::BindPresentationServiceRequest,
+                 base::Unretained(this)));
+
+  registry_->AddInterface(
+      base::Bind(&MediaSessionServiceImpl::Create, base::Unretained(this)));
+
+  registry_->AddInterface(base::Bind(
+      base::IgnoreResult(&RenderFrameHostImpl::CreateWebBluetoothService),
+      base::Unretained(this)));
+
+  registry_->AddInterface(base::BindRepeating(
+      &RenderFrameHostImpl::CreateWebUsbService, base::Unretained(this)));
+
+  registry_->AddInterface<media::mojom::InterfaceFactory>(
+      base::Bind(&RenderFrameHostImpl::BindMediaInterfaceFactoryRequest,
+                 base::Unretained(this)));
+
+  registry_->AddInterface(base::BindRepeating(
+      &RenderFrameHostImpl::CreateWebSocket, base::Unretained(this)));
+
+  registry_->AddInterface(base::BindRepeating(
+      &RenderFrameHostImpl::CreateDedicatedWorkerHostFactory,
+      base::Unretained(this)));
+
+  registry_->AddInterface(base::Bind(&SharedWorkerConnectorImpl::Create,
+                                     process_->GetID(), routing_id_));
+
+  registry_->AddInterface(base::BindRepeating(&device::GamepadMonitor::Create));
+
+  registry_->AddInterface<device::mojom::VRService>(base::Bind(
+      &WebvrServiceProvider::BindWebvrService, base::Unretained(this)));
+
+  registry_->AddInterface(
+      base::BindRepeating(&RenderFrameHostImpl::CreateAudioInputStreamFactory,
+                          base::Unretained(this)));
+
+  registry_->AddInterface(
+      base::BindRepeating(&RenderFrameHostImpl::CreateAudioOutputStreamFactory,
+                          base::Unretained(this)));
+
+  registry_->AddInterface(
+      base::Bind(&CreateFrameResourceCoordinator, base::Unretained(this)));
+
+  if (BrowserMainLoop::GetInstance()) {
+    MediaStreamManager* media_stream_manager =
+        BrowserMainLoop::GetInstance()->media_stream_manager();
+    registry_->AddInterface(
+        base::Bind(&MediaDevicesDispatcherHost::Create, GetProcess()->GetID(),
+                   GetRoutingID(), base::Unretained(media_stream_manager)),
+         base::CreateSingleThreadTaskRunnerWithTraits({BrowserThread::IO}));
+ 
+     registry_->AddInterface(
+        base::BindRepeating(
+            &RenderFrameHostImpl::CreateMediaStreamDispatcherHost,
+            base::Unretained(this), base::Unretained(media_stream_manager)),
+         base::CreateSingleThreadTaskRunnerWithTraits({BrowserThread::IO}));
+   }
+ 
+#if BUILDFLAG(ENABLE_MEDIA_REMOTING)
+  registry_->AddInterface(base::Bind(&RemoterFactoryImpl::Bind,
+                                     GetProcess()->GetID(), GetRoutingID()));
+#endif  // BUILDFLAG(ENABLE_MEDIA_REMOTING)
+
+  registry_->AddInterface(base::BindRepeating(
+      &KeyboardLockServiceImpl::CreateMojoService, base::Unretained(this)));
+
+  registry_->AddInterface(base::Bind(&ImageCaptureImpl::Create));
+
+#if !defined(OS_ANDROID)
+  if (base::FeatureList::IsEnabled(features::kWebAuth)) {
+    registry_->AddInterface(
+        base::Bind(&RenderFrameHostImpl::BindAuthenticatorRequest,
+                   base::Unretained(this)));
+    if (base::CommandLine::ForCurrentProcess()->HasSwitch(
+            switches::kEnableWebAuthTestingAPI)) {
+      auto* environment_singleton =
+          ScopedVirtualAuthenticatorEnvironment::GetInstance();
+      registry_->AddInterface(base::BindRepeating(
+          &ScopedVirtualAuthenticatorEnvironment::AddBinding,
+          base::Unretained(environment_singleton)));
+    }
+  }
+#endif  // !defined(OS_ANDROID)
+
+  sensor_provider_proxy_.reset(
+      new SensorProviderProxyImpl(permission_controller, this));
+  registry_->AddInterface(
+      base::Bind(&SensorProviderProxyImpl::Bind,
+                 base::Unretained(sensor_provider_proxy_.get())));
+
+  media::VideoDecodePerfHistory::SaveCallback save_stats_cb;
+  if (GetSiteInstance()->GetBrowserContext()->GetVideoDecodePerfHistory()) {
+    save_stats_cb = GetSiteInstance()
+                        ->GetBrowserContext()
+                        ->GetVideoDecodePerfHistory()
+                        ->GetSaveCallback();
+  }
+
+  registry_->AddInterface(base::BindRepeating(
+      &media::MediaMetricsProvider::Create, frame_tree_node_->IsMainFrame(),
+      base::BindRepeating(
+          &RenderFrameHostDelegate::GetUkmSourceIdForLastCommittedSource,
+          base::Unretained(delegate_)),
+      std::move(save_stats_cb)));
+
+  if (base::CommandLine::ForCurrentProcess()->HasSwitch(
+          cc::switches::kEnableGpuBenchmarking)) {
+    registry_->AddInterface(
+        base::Bind(&InputInjectorImpl::Create, weak_ptr_factory_.GetWeakPtr()));
+  }
+
+  registry_->AddInterface(base::BindRepeating(
+      &QuotaDispatcherHost::CreateForFrame, GetProcess(), routing_id_));
+
+  registry_->AddInterface(
+      base::BindRepeating(SpeechRecognitionDispatcherHost::Create,
+                          GetProcess()->GetID(), routing_id_),
+      base::CreateSingleThreadTaskRunnerWithTraits({BrowserThread::IO}));
+
+  file_system_manager_.reset(new FileSystemManagerImpl(
+      GetProcess()->GetID(), routing_id_,
+      GetProcess()->GetStoragePartition()->GetFileSystemContext(),
+      ChromeBlobStorageContext::GetFor(GetProcess()->GetBrowserContext())));
+  registry_->AddInterface(
+      base::BindRepeating(&FileSystemManagerImpl::BindRequest,
+                          base::Unretained(file_system_manager_.get())),
+      base::CreateSingleThreadTaskRunnerWithTraits({BrowserThread::IO}));
+
+  if (Portal::IsEnabled()) {
+    registry_->AddInterface(base::BindRepeating(IgnoreResult(&Portal::Create),
+                                                base::Unretained(this)));
+  }
+
+  registry_->AddInterface(base::BindRepeating(
+      &BackgroundFetchServiceImpl::CreateForFrame, GetProcess(), routing_id_));
+
+  registry_->AddInterface(base::BindRepeating(&ContactsManagerImpl::Create));
+
+  registry_->AddInterface(
+      base::BindRepeating(&FileChooserImpl::Create, base::Unretained(this)));
+
+  registry_->AddInterface(base::BindRepeating(&AudioContextManagerImpl::Create,
+                                              base::Unretained(this)));
+
+  registry_->AddInterface(base::BindRepeating(&WakeLockServiceImpl::Create,
+                                              base::Unretained(this)));
+}
+"
+"void MediaStreamDispatcherHost::BindRequest(
+     mojom::MediaStreamDispatcherHostRequest request) {
+   DCHECK_CURRENTLY_ON(BrowserThread::IO);
+  bindings_.AddBinding(this, std::move(request));
+ }
+"
+" void MediaStreamDispatcherHost::CancelAllRequests() {
+  if (!bindings_.empty())
+    return;
+  media_stream_manager_->CancelAllRequests(render_process_id_,
+                                           render_frame_id_);
+ }
+"
+"void MediaStreamDispatcherHost::CancelRequest(int page_request_id) {
+   DCHECK_CURRENTLY_ON(BrowserThread::IO);
+ 
+   media_stream_manager_->CancelRequest(render_process_id_, render_frame_id_,
+                                       page_request_id);
+ }
+"
+"void MediaStreamDispatcherHost::DoGenerateStream(
+    int32_t page_request_id,
+    const StreamControls& controls,
+    bool user_gesture,
+    GenerateStreamCallback callback,
+    MediaDeviceSaltAndOrigin salt_and_origin) {
+  DCHECK_CURRENTLY_ON(BrowserThread::IO);
+  if (!MediaStreamManager::IsOriginAllowed(render_process_id_,
+                                           salt_and_origin.origin)) {
+    std::move(callback).Run(MEDIA_DEVICE_INVALID_SECURITY_ORIGIN, std::string(),
+                            MediaStreamDevices(), MediaStreamDevices());
+    return;
+   }
+ 
+   media_stream_manager_->GenerateStream(
+      render_process_id_, render_frame_id_, page_request_id, controls,
+      std::move(salt_and_origin), user_gesture, std::move(callback),
+       base::BindRepeating(&MediaStreamDispatcherHost::OnDeviceStopped,
+                           weak_factory_.GetWeakPtr()),
+       base::BindRepeating(&MediaStreamDispatcherHost::OnDeviceChanged,
+                          weak_factory_.GetWeakPtr()));
+}
+"
+"void MediaStreamDispatcherHost::DoOpenDevice(
+    int32_t page_request_id,
+    const std::string& device_id,
+    MediaStreamType type,
+    OpenDeviceCallback callback,
+    MediaDeviceSaltAndOrigin salt_and_origin) {
+  DCHECK_CURRENTLY_ON(BrowserThread::IO);
+  if (!MediaStreamManager::IsOriginAllowed(render_process_id_,
+                                           salt_and_origin.origin)) {
+    std::move(callback).Run(false /* success */, std::string(),
+                            MediaStreamDevice());
+    return;
+   }
+ 
+   media_stream_manager_->OpenDevice(
+      render_process_id_, render_frame_id_, page_request_id, device_id, type,
+      std::move(salt_and_origin), std::move(callback),
+       base::BindRepeating(&MediaStreamDispatcherHost::OnDeviceStopped,
+                           weak_factory_.GetWeakPtr()));
+ }
+"
+" MediaStreamDispatcherHost::MediaStreamDispatcherHost(
+     int render_process_id,
+     int render_frame_id,
+     MediaStreamManager* media_stream_manager)
+     : render_process_id_(render_process_id),
+       render_frame_id_(render_frame_id),
+       media_stream_manager_(media_stream_manager),
+       salt_and_origin_callback_(
+           base::BindRepeating(&GetMediaDeviceSaltAndOrigin)),
+       weak_factory_(this) {
+   DCHECK_CURRENTLY_ON(BrowserThread::IO);
+  bindings_.set_connection_error_handler(
+      base::Bind(&MediaStreamDispatcherHost::CancelAllRequests,
+                 weak_factory_.GetWeakPtr()));
+ }
+"
+" void MediaStreamDispatcherHost::StopStreamDevice(const std::string& device_id,
+                                                  int32_t session_id) {
+   DCHECK_CURRENTLY_ON(BrowserThread::IO);
+ 
+   media_stream_manager_->StopStreamDevice(render_process_id_, render_frame_id_,
+                                          device_id, session_id);
+ }
+"
+" MediaStreamDispatcherHost::~MediaStreamDispatcherHost() {
+   DCHECK_CURRENTLY_ON(BrowserThread::IO);
+  bindings_.CloseAllBindings();
+   CancelAllRequests();
+ }
+"
+" void MediaStreamManager::CancelAllRequests(int render_process_id,
+                                           int render_frame_id) {
+   DCHECK_CURRENTLY_ON(BrowserThread::IO);
+   auto request_it = requests_.begin();
+   while (request_it != requests_.end()) {
+     if (request_it->second->requesting_process_id != render_process_id ||
+        request_it->second->requesting_frame_id != render_frame_id) {
+       ++request_it;
+       continue;
+     }
+    const std::string label = request_it->first;
+    ++request_it;
+    CancelRequest(label);
+  }
+}
+"
+" void MediaStreamManager::GenerateStream(
+     int render_process_id,
+     int render_frame_id,
+     int page_request_id,
+     const StreamControls& controls,
+     MediaDeviceSaltAndOrigin salt_and_origin,
+    bool user_gesture,
+    GenerateStreamCallback generate_stream_cb,
+    DeviceStoppedCallback device_stopped_cb,
+    DeviceChangedCallback device_changed_cb) {
+  DCHECK_CURRENTLY_ON(BrowserThread::IO);
+   DVLOG(1) << ""GenerateStream()"";
+ 
+   DeviceRequest* request = new DeviceRequest(
+      render_process_id, render_frame_id, page_request_id, user_gesture,
+      MEDIA_GENERATE_STREAM, controls, std::move(salt_and_origin),
+       std::move(device_stopped_cb));
+   request->device_changed_cb = std::move(device_changed_cb);
+ 
+  const std::string& label = AddRequest(request);
+
+  request->generate_stream_cb = std::move(generate_stream_cb);
+
+  if (generate_stream_test_callback_) {
+    if (std::move(generate_stream_test_callback_).Run(controls)) {
+      FinalizeGenerateStream(label, request);
+    } else {
+      FinalizeRequestFailed(label, request, MEDIA_DEVICE_INVALID_STATE);
+    }
+    return;
+  }
+
+  base::PostTaskWithTraits(FROM_HERE, {BrowserThread::IO},
+                           base::BindOnce(&MediaStreamManager::SetUpRequest,
+                                          base::Unretained(this), label));
+}
+"
+" std::string MediaStreamManager::MakeMediaAccessRequest(
+     int render_process_id,
+     int render_frame_id,
+     int page_request_id,
+     const StreamControls& controls,
+     const url::Origin& security_origin,
+     MediaAccessRequestCallback callback) {
+   DCHECK_CURRENTLY_ON(BrowserThread::IO);
+ 
+   DeviceRequest* request = new DeviceRequest(
+      render_process_id, render_frame_id, page_request_id,
+       false /* user gesture */, MEDIA_DEVICE_ACCESS, controls,
+       MediaDeviceSaltAndOrigin{std::string() /* salt */,
+                                std::string() /* group_id_salt */,
+                               security_origin});
+
+  const std::string& label = AddRequest(request);
+
+  request->media_access_request_cb = std::move(callback);
+  base::PostTaskWithTraits(FROM_HERE, {BrowserThread::IO},
+                           base::BindOnce(&MediaStreamManager::SetUpRequest,
+                                          base::Unretained(this), label));
+  return label;
+}
+"
+" void MediaStreamManager::OpenDevice(int render_process_id,
+                                     int render_frame_id,
+                                     int page_request_id,
+                                     const std::string& device_id,
+                                     MediaStreamType type,
+                                    MediaDeviceSaltAndOrigin salt_and_origin,
+                                    OpenDeviceCallback open_device_cb,
+                                    DeviceStoppedCallback device_stopped_cb) {
+  DCHECK_CURRENTLY_ON(BrowserThread::IO);
+  DCHECK(type == MEDIA_DEVICE_AUDIO_CAPTURE ||
+         type == MEDIA_DEVICE_VIDEO_CAPTURE);
+  DVLOG(1) << ""OpenDevice ({page_request_id = "" << page_request_id << ""})"";
+  StreamControls controls;
+  if (IsAudioInputMediaType(type)) {
+    controls.audio.requested = true;
+    controls.audio.stream_type = type;
+    controls.audio.device_id = device_id;
+  } else if (IsVideoInputMediaType(type)) {
+    controls.video.requested = true;
+    controls.video.stream_type = type;
+    controls.video.device_id = device_id;
+  } else {
+     NOTREACHED();
+   }
+   DeviceRequest* request = new DeviceRequest(
+      render_process_id, render_frame_id, page_request_id,
+       false /* user gesture */, MEDIA_OPEN_DEVICE_PEPPER_ONLY, controls,
+       std::move(salt_and_origin), std::move(device_stopped_cb));
+ 
+  const std::string& label = AddRequest(request);
+
+  request->open_device_cb = std::move(open_device_cb);
+  base::PostTaskWithTraits(FROM_HERE, {BrowserThread::IO},
+                           base::BindOnce(&MediaStreamManager::SetUpRequest,
+                                          base::Unretained(this), label));
+}
+"
+"   std::string MakeMediaAccessRequest(int index) {
+     const int render_process_id = 1;
+     const int render_frame_id = 1;
+     const int page_request_id = 1;
+     const url::Origin security_origin;
+     MediaStreamManager::MediaAccessRequestCallback callback =
+         base::BindOnce(&MediaStreamManagerTest::ResponseCallback,
+                        base::Unretained(this), index);
+     StreamControls controls(true, true);
+     return media_stream_manager_->MakeMediaAccessRequest(
+        render_process_id, render_frame_id, page_request_id, controls,
+        security_origin, std::move(callback));
+   }
+"
+" VideoCaptureManager::~VideoCaptureManager() {
+  DCHECK(controllers_.empty());
+   DCHECK(device_start_request_queue_.empty());
+   if (screenlock_monitor_) {
+     screenlock_monitor_->RemoveObserver(this);
+  }
+}
+"
+"   void OpenSession() {
+     const int render_process_id = 1;
+     const int render_frame_id = 1;
+     const int page_request_id = 1;
+     const url::Origin security_origin =
+         url::Origin::Create(GURL(""http://test.com""));
+
+    ASSERT_TRUE(opened_device_label_.empty());
+
+    MediaDeviceInfoArray video_devices;
+    {
+      base::RunLoop run_loop;
+      MediaDevicesManager::BoolDeviceTypes devices_to_enumerate;
+      devices_to_enumerate[MEDIA_DEVICE_TYPE_VIDEO_INPUT] = true;
+      media_stream_manager_->media_devices_manager()->EnumerateDevices(
+          devices_to_enumerate,
+          base::BindOnce(&VideoInputDevicesEnumerated, run_loop.QuitClosure(),
+                         browser_context_.GetMediaDeviceIDSalt(),
+                         security_origin, &video_devices));
+      run_loop.Run();
+    }
+    ASSERT_FALSE(video_devices.empty());
+
+     {
+       base::RunLoop run_loop;
+       media_stream_manager_->OpenDevice(
+          render_process_id, render_frame_id, page_request_id,
+           video_devices[0].device_id, MEDIA_DEVICE_VIDEO_CAPTURE,
+           MediaDeviceSaltAndOrigin{browser_context_.GetMediaDeviceIDSalt(),
+                                    browser_context_.GetMediaDeviceIDSalt(),
+                                   security_origin},
+          base::BindOnce(&VideoCaptureTest::OnDeviceOpened,
+                         base::Unretained(this), run_loop.QuitClosure()),
+          MediaStreamManager::DeviceStoppedCallback());
+      run_loop.Run();
+    }
+    ASSERT_NE(MediaStreamDevice::kNoId, opened_session_id_);
+  }
+"
+"void SpeechRecognitionManagerImpl::RecognitionAllowedCallback(int session_id,
+                                                              bool ask_user,
+                                                              bool is_allowed) {
+  DCHECK_CURRENTLY_ON(BrowserThread::IO);
+
+  auto iter = sessions_.find(session_id);
+  if (iter == sessions_.end())
+    return;
+
+  Session* session = iter->second.get();
+
+  if (session->abort_requested)
+    return;
+
+   if (ask_user) {
+     SpeechRecognitionSessionContext& context = session->context;
+     context.label = media_stream_manager_->MakeMediaAccessRequest(
+        context.render_process_id, context.render_frame_id, session_id,
+        StreamControls(true, false), context.security_origin,
+         base::BindOnce(
+             &SpeechRecognitionManagerImpl::MediaRequestPermissionCallback,
+             weak_factory_.GetWeakPtr(), session_id));
+    return;
+  }
+
+  if (is_allowed) {
+    base::ThreadTaskRunnerHandle::Get()->PostTask(
+        FROM_HERE,
+        base::BindOnce(&SpeechRecognitionManagerImpl::DispatchEvent,
+                       weak_factory_.GetWeakPtr(), session_id, EVENT_START));
+  } else {
+    OnRecognitionError(
+        session_id, blink::mojom::SpeechRecognitionError(
+                        blink::mojom::SpeechRecognitionErrorCode::kNotAllowed,
+                        blink::mojom::SpeechAudioErrorDetails::kNone));
+    base::ThreadTaskRunnerHandle::Get()->PostTask(
+        FROM_HERE,
+        base::BindOnce(&SpeechRecognitionManagerImpl::DispatchEvent,
+                       weak_factory_.GetWeakPtr(), session_id, EVENT_ABORT));
+  }
+}
+"
+"DOMHandler::DOMHandler()
+     : DevToolsDomainHandler(DOM::Metainfo::domainName),
+      host_(nullptr) {
+}
+"
+"bool RenderFrameDevToolsAgentHost::AttachSession(DevToolsSession* session) {
+  if (!ShouldAllowSession(session))
+    return false;
+
+   protocol::EmulationHandler* emulation_handler =
+       new protocol::EmulationHandler();
+   session->AddHandler(base::WrapUnique(new protocol::BrowserHandler()));
+  session->AddHandler(base::WrapUnique(new protocol::DOMHandler()));
+   session->AddHandler(base::WrapUnique(emulation_handler));
+   session->AddHandler(base::WrapUnique(new protocol::InputHandler()));
+   session->AddHandler(base::WrapUnique(new protocol::InspectorHandler()));
+  session->AddHandler(base::WrapUnique(new protocol::IOHandler(
+      GetIOContext())));
+  session->AddHandler(base::WrapUnique(new protocol::MemoryHandler()));
+  session->AddHandler(base::WrapUnique(new protocol::NetworkHandler(
+      GetId(),
+      frame_tree_node_ ? frame_tree_node_->devtools_frame_token()
+                       : base::UnguessableToken(),
+      GetIOContext())));
+  session->AddHandler(base::WrapUnique(new protocol::SchemaHandler()));
+  session->AddHandler(base::WrapUnique(new protocol::ServiceWorkerHandler()));
+  session->AddHandler(base::WrapUnique(new protocol::StorageHandler()));
+  session->AddHandler(base::WrapUnique(new protocol::TargetHandler(
+      session->client()->MayAttachToBrowser()
+          ? protocol::TargetHandler::AccessMode::kRegular
+          : protocol::TargetHandler::AccessMode::kAutoAttachOnly,
+      GetId(), GetRendererChannel(), session->GetRootSession())));
+  session->AddHandler(base::WrapUnique(new protocol::PageHandler(
+      emulation_handler, session->client()->MayAffectLocalFiles())));
+  session->AddHandler(base::WrapUnique(new protocol::SecurityHandler()));
+  if (!frame_tree_node_ || !frame_tree_node_->parent()) {
+    session->AddHandler(base::WrapUnique(
+        new protocol::TracingHandler(frame_tree_node_, GetIOContext())));
+  }
+
+  if (sessions().empty()) {
+    bool use_video_capture_api = true;
+#ifdef OS_ANDROID
+    if (!CompositorImpl::IsInitialized())
+      use_video_capture_api = false;
+#endif
+    if (!use_video_capture_api)
+      frame_trace_recorder_.reset(new DevToolsFrameTraceRecorder());
+    GrantPolicy();
+#if defined(OS_ANDROID)
+    GetWakeLock()->RequestWakeLock();
+#endif
+  }
+  return true;
+}
+"
+"IDNSpoofChecker::IDNSpoofChecker() {
+  UErrorCode status = U_ZERO_ERROR;
+  checker_ = uspoof_open(&status);
+  if (U_FAILURE(status)) {
+    checker_ = nullptr;
+    return;
+  }
+
+
+  uspoof_setRestrictionLevel(checker_, USPOOF_HIGHLY_RESTRICTIVE);
+
+  SetAllowedUnicodeSet(&status);
+
+  int32_t checks = uspoof_getChecks(checker_, &status) | USPOOF_AUX_INFO;
+  uspoof_setChecks(checker_, checks, &status);
+
+  deviation_characters_ = icu::UnicodeSet(
+      UNICODE_STRING_SIMPLE(""[\\u00df\\u03c2\\u200c\\u200d]""), status);
+  deviation_characters_.freeze();
+
+  non_ascii_latin_letters_ =
+      icu::UnicodeSet(UNICODE_STRING_SIMPLE(""[[:Latin:] - [a-zA-Z]]""), status);
+  non_ascii_latin_letters_.freeze();
+
+  kana_letters_exceptions_ = icu::UnicodeSet(
+      UNICODE_STRING_SIMPLE(""[\\u3078-\\u307a\\u30d8-\\u30da\\u30fb-\\u30fe]""),
+      status);
+  kana_letters_exceptions_.freeze();
+  combining_diacritics_exceptions_ =
+      icu::UnicodeSet(UNICODE_STRING_SIMPLE(""[\\u0300-\\u0339]""), status);
+  combining_diacritics_exceptions_.freeze();
+
+  cyrillic_letters_latin_alike_ = icu::UnicodeSet(
+      icu::UnicodeString::fromUTF8(""[асԁеһіјӏорԗԛѕԝхуъЬҽпгѵѡ]""), status);
+  cyrillic_letters_latin_alike_.freeze();
+
+  cyrillic_letters_ =
+      icu::UnicodeSet(UNICODE_STRING_SIMPLE(""[[:Cyrl:]]""), status);
+  cyrillic_letters_.freeze();
+
+  DCHECK(U_SUCCESS(status));
+  lgc_letters_n_ascii_ = icu::UnicodeSet(
+      UNICODE_STRING_SIMPLE(""[[:Latin:][:Greek:][:Cyrillic:][0-9\\u002e_""
+                            ""\\u002d][\\u0300-\\u0339]]""),
+      status);
+  lgc_letters_n_ascii_.freeze();
+
+  UParseError parse_error;
+  diacritic_remover_.reset(icu::Transliterator::createFromRules(
+      UNICODE_STRING_SIMPLE(""DropAcc""),
+      icu::UnicodeString::fromUTF8(""::NFD; ::[:Nonspacing Mark:] Remove; ::NFC;""
+                                   "" ł > l; ø > o; đ > d;""),
+      UTRANS_FORWARD, parse_error, status));
+
+   extra_confusable_mapper_.reset(icu::Transliterator::createFromRules(
+       UNICODE_STRING_SIMPLE(""ExtraConf""),
+       icu::UnicodeString::fromUTF8(
+          ""[æӕ] > ae; [þϼҏ] > p; [ħнћңҥӈӊԋԧԩ] > h;""
+          ""[ĸκкқҝҟҡӄԟ] > k; [ŋпԥก] > n; œ > ce;""
+          ""[ŧтҭԏ] > t; [ƅьҍв] > b;  [ωшщพฟພຟ] > w;""
+           ""[мӎ] > m; [єҽҿၔ] > e; ґ > r; [ғӻ] > f;""
+           ""[ҫင] > c; ұ > y; [χҳӽӿ] > x;""
+           ""ԃ  > d; [ԍဌ] > g; [ടรຣຮ] > s; ၂ > j;""
+          ""[зҙӡउওဒვპ] > 3; [บບ] > u""),
+       UTRANS_FORWARD, parse_error, status));
+   DCHECK(U_SUCCESS(status))
+       << ""Spoofchecker initalization failed due to an error: ""
+      << u_errorName(status);
+}
+"
+"IDNSpoofChecker::IDNSpoofChecker() {
+  UErrorCode status = U_ZERO_ERROR;
+  checker_ = uspoof_open(&status);
+  if (U_FAILURE(status)) {
+    checker_ = nullptr;
+    return;
+  }
+
+
+  uspoof_setRestrictionLevel(checker_, USPOOF_HIGHLY_RESTRICTIVE);
+
+  SetAllowedUnicodeSet(&status);
+
+  int32_t checks = uspoof_getChecks(checker_, &status) | USPOOF_AUX_INFO;
+  uspoof_setChecks(checker_, checks, &status);
+
+  deviation_characters_ = icu::UnicodeSet(
+      UNICODE_STRING_SIMPLE(""[\\u00df\\u03c2\\u200c\\u200d]""), status);
+  deviation_characters_.freeze();
+
+  non_ascii_latin_letters_ =
+      icu::UnicodeSet(UNICODE_STRING_SIMPLE(""[[:Latin:] - [a-zA-Z]]""), status);
+  non_ascii_latin_letters_.freeze();
+
+  kana_letters_exceptions_ = icu::UnicodeSet(
+      UNICODE_STRING_SIMPLE(""[\\u3078-\\u307a\\u30d8-\\u30da\\u30fb-\\u30fe]""),
+      status);
+  kana_letters_exceptions_.freeze();
+  combining_diacritics_exceptions_ =
+      icu::UnicodeSet(UNICODE_STRING_SIMPLE(""[\\u0300-\\u0339]""), status);
+  combining_diacritics_exceptions_.freeze();
+
+   cyrillic_letters_latin_alike_ = icu::UnicodeSet(
+      icu::UnicodeString::fromUTF8(""[асԁеһіјӏорԛѕԝхуъЬҽпгѵѡ]""), status);
+   cyrillic_letters_latin_alike_.freeze();
+ 
+   cyrillic_letters_ =
+      icu::UnicodeSet(UNICODE_STRING_SIMPLE(""[[:Cyrl:]]""), status);
+  cyrillic_letters_.freeze();
+
+  DCHECK(U_SUCCESS(status));
+  lgc_letters_n_ascii_ = icu::UnicodeSet(
+      UNICODE_STRING_SIMPLE(""[[:Latin:][:Greek:][:Cyrillic:][0-9\\u002e_""
+                            ""\\u002d][\\u0300-\\u0339]]""),
+      status);
+  lgc_letters_n_ascii_.freeze();
+
+  UParseError parse_error;
+  diacritic_remover_.reset(icu::Transliterator::createFromRules(
+      UNICODE_STRING_SIMPLE(""DropAcc""),
+      icu::UnicodeString::fromUTF8(""::NFD; ::[:Nonspacing Mark:] Remove; ::NFC;""
+                                   "" ł > l; ø > o; đ > d;""),
+      UTRANS_FORWARD, parse_error, status));
+
+  extra_confusable_mapper_.reset(icu::Transliterator::createFromRules(
+      UNICODE_STRING_SIMPLE(""ExtraConf""),
+      icu::UnicodeString::fromUTF8(
+          ""[æӕ] > ae; [þϼҏ] > p; [ħнћңҥӈӊԋԧԩ] > h;""
+          ""[ĸκкқҝҟҡӄԟ] > k; [ŋпԥก] > n; œ > ce;""
+          ""[ŧтҭԏ] > t; [ƅьҍв] > b;  [ωшщพฟພຟ] > w;""
+          ""[мӎ] > m; [єҽҿၔ] > e; ґ > r; [ғӻ] > f;""
+          ""[ҫင] > c; ұ > y; [χҳӽӿ] > x;""
+          ""ԃ  > d; [ԍဌ] > g; [ടรຣຮ] > s; ၂ > j;""
+          ""[зҙӡउওဒვპ] > 3; [บບ] > u""),
+      UTRANS_FORWARD, parse_error, status));
+  DCHECK(U_SUCCESS(status))
+      << ""Spoofchecker initalization failed due to an error: ""
+      << u_errorName(status);
+}
+"
+"bool UnpackOriginPermissions(const std::vector<std::string>& origins_input,
+                             const PermissionSet& required_permissions,
+                             const PermissionSet& optional_permissions,
+                             bool allow_file_access,
+                             UnpackPermissionSetResult* result,
+                             std::string* error) {
+  int user_script_schemes = UserScript::ValidUserScriptSchemes();
+  int explicit_schemes = Extension::kValidHostPermissionSchemes;
+  if (!allow_file_access) {
+    user_script_schemes &= ~URLPattern::SCHEME_FILE;
+     explicit_schemes &= ~URLPattern::SCHEME_FILE;
+   }
+ 
+   for (const auto& origin_str : origins_input) {
+     URLPattern explicit_origin(explicit_schemes);
+     URLPattern::ParseResult parse_result = explicit_origin.Parse(origin_str);
+    if (URLPattern::ParseResult::kSuccess != parse_result) {
+      *error = ErrorUtils::FormatErrorMessage(
+          kInvalidOrigin, origin_str,
+          URLPattern::GetParseResultString(parse_result));
+       return false;
+     }
+ 
+     bool used_origin = false;
+     if (required_permissions.explicit_hosts().ContainsPattern(
+             explicit_origin)) {
+      used_origin = true;
+      result->required_explicit_hosts.AddPattern(explicit_origin);
+    } else if (optional_permissions.explicit_hosts().ContainsPattern(
+                   explicit_origin)) {
+      used_origin = true;
+      result->optional_explicit_hosts.AddPattern(explicit_origin);
+    }
+ 
+     URLPattern scriptable_origin(user_script_schemes);
+     if (scriptable_origin.Parse(origin_str) ==
+            URLPattern::ParseResult::kSuccess &&
+        required_permissions.scriptable_hosts().ContainsPattern(
+            scriptable_origin)) {
+      used_origin = true;
+      result->required_scriptable_hosts.AddPattern(scriptable_origin);
+     }
+ 
+     if (!used_origin)
+      result->unlisted_hosts.AddPattern(explicit_origin);
+  }
+
+  return true;
+}
+"
+"bool PermissionsData::CanCaptureVisiblePage(
+    const GURL& document_url,
+    int tab_id,
+    std::string* error,
+    CaptureRequirement capture_requirement) const {
+  bool has_active_tab = false;
+  bool has_all_urls = false;
+  bool has_page_capture = false;
+  url::Origin origin = url::Origin::Create(document_url);
+  const GURL origin_url = origin.GetURL();
+  {
+    base::AutoLock auto_lock(runtime_lock_);
+    if (location_ != Manifest::COMPONENT &&
+        IsPolicyBlockedHostUnsafe(origin_url)) {
+      if (error)
+        *error = extension_misc::kPolicyBlockedScripting;
+      return false;
+    }
+
+    const PermissionSet* tab_permissions = GetTabSpecificPermissions(tab_id);
+     has_active_tab = tab_permissions &&
+                      tab_permissions->HasAPIPermission(APIPermission::kTab);
+ 
+    const URLPattern all_urls(URLPattern::SCHEME_ALL,
+                              URLPattern::kAllUrlsPattern);
+    has_all_urls =
+        active_permissions_unsafe_->explicit_hosts().ContainsPattern(all_urls);
+     has_page_capture = active_permissions_unsafe_->HasAPIPermission(
+         APIPermission::kPageCapture);
+   }
+  std::string access_error;
+  if (capture_requirement == CaptureRequirement::kActiveTabOrAllUrls) {
+    if (!has_active_tab && !has_all_urls) {
+      if (error)
+        *error = manifest_errors::kAllURLOrActiveTabNeeded;
+      return false;
+    }
+
+    if (GetPageAccess(origin_url, tab_id, &access_error) ==
+        PageAccess::kAllowed)
+      return true;
+  } else {
+    DCHECK_EQ(CaptureRequirement::kPageCapture, capture_requirement);
+    if (!has_page_capture) {
+      if (error)
+        *error = manifest_errors::kPageCaptureNeeded;
+    }
+
+    if ((origin_url.SchemeIs(url::kHttpScheme) ||
+         origin_url.SchemeIs(url::kHttpsScheme)) &&
+        !origin.IsSameOriginWith(url::Origin::Create(
+            ExtensionsClient::Get()->GetWebstoreBaseURL()))) {
+      return true;
+    }
+  }
+
+
+  if (origin_url.host() == extension_id_)
+    return true;
+
+  bool allowed_with_active_tab =
+      origin_url.SchemeIs(content::kChromeUIScheme) ||
+      origin_url.SchemeIs(kExtensionScheme) ||
+      document_url.SchemeIs(url::kDataScheme) ||
+      origin.IsSameOriginWith(
+          url::Origin::Create(ExtensionsClient::Get()->GetWebstoreBaseURL()));
+
+  if (!allowed_with_active_tab) {
+    if (error)
+      *error = access_error;
+    return false;
+  }
+  if (has_active_tab)
+    return true;
+
+  if (error)
+    *error = manifest_errors::kActiveTabPermissionNotGranted;
+  return false;
+}
+"
+" void ChromeContentBrowserClient::OpenURL(
+    content::BrowserContext* browser_context,
+     const content::OpenURLParams& params,
+    const base::Callback<void(content::WebContents*)>& callback) {
+   DCHECK_CURRENTLY_ON(BrowserThread::UI);
+ 
+ #if defined(OS_ANDROID)
+   ServiceTabLauncher::GetInstance()->LaunchTab(browser_context, params,
+                                               callback);
+#else
+  NavigateParams nav_params(Profile::FromBrowserContext(browser_context),
+                            params.url, params.transition);
+  nav_params.FillNavigateParamsFromOpenURLParams(params);
+  nav_params.user_gesture = params.user_gesture;
+
+  Navigate(&nav_params);
+  callback.Run(nav_params.navigated_or_inserted_contents);
+#endif
+}
+"
+"bool BrowserCommandController::ExecuteCommandWithDisposition(
+    int id, WindowOpenDisposition disposition) {
+  if (!SupportsCommand(id) || !IsCommandEnabled(id))
+    return false;
+
+  if (browser_->tab_strip_model()->active_index() == TabStripModel::kNoTab)
+    return true;
+
+  DCHECK(command_updater_.IsCommandEnabled(id)) << ""Invalid/disabled command ""
+                                                << id;
+
+  switch (id) {
+    case IDC_BACK:
+      GoBack(browser_, disposition);
+      break;
+    case IDC_FORWARD:
+      GoForward(browser_, disposition);
+      break;
+    case IDC_RELOAD:
+      Reload(browser_, disposition);
+      break;
+    case IDC_RELOAD_CLEARING_CACHE:
+      ClearCache(browser_);
+      FALLTHROUGH;
+    case IDC_RELOAD_BYPASSING_CACHE:
+      ReloadBypassingCache(browser_, disposition);
+      break;
+    case IDC_HOME:
+      Home(browser_, disposition);
+      break;
+    case IDC_OPEN_CURRENT_URL:
+      OpenCurrentURL(browser_);
+      break;
+    case IDC_STOP:
+      Stop(browser_);
+      break;
+
+    case IDC_NEW_WINDOW:
+      NewWindow(browser_);
+      break;
+    case IDC_NEW_INCOGNITO_WINDOW:
+      NewIncognitoWindow(profile());
+      break;
+    case IDC_CLOSE_WINDOW:
+      base::RecordAction(base::UserMetricsAction(""CloseWindowByKey""));
+      CloseWindow(browser_);
+      break;
+    case IDC_NEW_TAB: {
+      NewTab(browser_);
+#if BUILDFLAG(ENABLE_DESKTOP_IN_PRODUCT_HELP)
+      auto* new_tab_tracker =
+          feature_engagement::NewTabTrackerFactory::GetInstance()
+              ->GetForProfile(profile());
+
+      new_tab_tracker->OnNewTabOpened();
+      new_tab_tracker->CloseBubble();
+#endif
+      break;
+    }
+    case IDC_CLOSE_TAB:
+      base::RecordAction(base::UserMetricsAction(""CloseTabByKey""));
+      CloseTab(browser_);
+      break;
+    case IDC_SELECT_NEXT_TAB:
+      base::RecordAction(base::UserMetricsAction(""Accel_SelectNextTab""));
+      SelectNextTab(browser_);
+      break;
+    case IDC_SELECT_PREVIOUS_TAB:
+      base::RecordAction(base::UserMetricsAction(""Accel_SelectPreviousTab""));
+      SelectPreviousTab(browser_);
+      break;
+    case IDC_MOVE_TAB_NEXT:
+      MoveTabNext(browser_);
+      break;
+    case IDC_MOVE_TAB_PREVIOUS:
+      MoveTabPrevious(browser_);
+      break;
+    case IDC_SELECT_TAB_0:
+    case IDC_SELECT_TAB_1:
+    case IDC_SELECT_TAB_2:
+    case IDC_SELECT_TAB_3:
+    case IDC_SELECT_TAB_4:
+    case IDC_SELECT_TAB_5:
+    case IDC_SELECT_TAB_6:
+    case IDC_SELECT_TAB_7:
+      base::RecordAction(base::UserMetricsAction(""Accel_SelectNumberedTab""));
+      SelectNumberedTab(browser_, id - IDC_SELECT_TAB_0);
+      break;
+    case IDC_SELECT_LAST_TAB:
+      base::RecordAction(base::UserMetricsAction(""Accel_SelectNumberedTab""));
+      SelectLastTab(browser_);
+      break;
+    case IDC_DUPLICATE_TAB:
+      DuplicateTab(browser_);
+      break;
+    case IDC_RESTORE_TAB:
+      RestoreTab(browser_);
+      break;
+    case IDC_SHOW_AS_TAB:
+      ConvertPopupToTabbedBrowser(browser_);
+      break;
+    case IDC_FULLSCREEN:
+      chrome::ToggleFullscreenMode(browser_);
+      break;
+    case IDC_OPEN_IN_PWA_WINDOW:
+      base::RecordAction(base::UserMetricsAction(""OpenActiveTabInPwaWindow""));
+      ReparentSecureActiveTabIntoPwaWindow(browser_);
+      break;
+
+#if defined(OS_CHROMEOS)
+    case IDC_VISIT_DESKTOP_OF_LRU_USER_2:
+    case IDC_VISIT_DESKTOP_OF_LRU_USER_3:
+      ExecuteVisitDesktopCommand(id, window()->GetNativeWindow());
+      break;
+#endif
+
+#if defined(OS_LINUX) && !defined(OS_CHROMEOS)
+    case IDC_MINIMIZE_WINDOW:
+      browser_->window()->Minimize();
+      break;
+    case IDC_MAXIMIZE_WINDOW:
+      browser_->window()->Maximize();
+      break;
+    case IDC_RESTORE_WINDOW:
+      browser_->window()->Restore();
+      break;
+    case IDC_USE_SYSTEM_TITLE_BAR: {
+      PrefService* prefs = profile()->GetPrefs();
+      prefs->SetBoolean(prefs::kUseCustomChromeFrame,
+                        !prefs->GetBoolean(prefs::kUseCustomChromeFrame));
+      break;
+    }
+#endif
+
+#if defined(OS_MACOSX)
+    case IDC_TOGGLE_FULLSCREEN_TOOLBAR:
+       chrome::ToggleFullscreenToolbar(browser_);
+       break;
+     case IDC_TOGGLE_JAVASCRIPT_APPLE_EVENTS: {
+      PrefService* prefs = profile()->GetPrefs();
+      prefs->SetBoolean(prefs::kAllowJavascriptAppleEvents,
+                        !prefs->GetBoolean(prefs::kAllowJavascriptAppleEvents));
+       break;
+     }
+ #endif
+    case IDC_EXIT:
+      Exit();
+      break;
+
+    case IDC_SAVE_PAGE:
+      SavePage(browser_);
+      break;
+    case IDC_BOOKMARK_PAGE:
+#if BUILDFLAG(ENABLE_DESKTOP_IN_PRODUCT_HELP)
+      feature_engagement::BookmarkTrackerFactory::GetInstance()
+          ->GetForProfile(profile())
+          ->OnBookmarkAdded();
+#endif
+      BookmarkCurrentPageAllowingExtensionOverrides(browser_);
+      break;
+    case IDC_BOOKMARK_ALL_TABS:
+#if BUILDFLAG(ENABLE_DESKTOP_IN_PRODUCT_HELP)
+      feature_engagement::BookmarkTrackerFactory::GetInstance()
+          ->GetForProfile(profile())
+          ->OnBookmarkAdded();
+#endif
+      BookmarkAllTabs(browser_);
+      break;
+    case IDC_VIEW_SOURCE:
+      browser_->tab_strip_model()
+          ->GetActiveWebContents()
+          ->GetMainFrame()
+          ->ViewSource();
+      break;
+    case IDC_EMAIL_PAGE_LOCATION:
+      EmailPageLocation(browser_);
+      break;
+    case IDC_PRINT:
+      Print(browser_);
+      break;
+
+#if BUILDFLAG(ENABLE_PRINTING)
+    case IDC_BASIC_PRINT:
+      base::RecordAction(base::UserMetricsAction(""Accel_Advanced_Print""));
+      BasicPrint(browser_);
+      break;
+#endif  // ENABLE_PRINTING
+
+    case IDC_SAVE_CREDIT_CARD_FOR_PAGE:
+      SaveCreditCard(browser_);
+      break;
+    case IDC_MIGRATE_LOCAL_CREDIT_CARD_FOR_PAGE:
+      MigrateLocalCards(browser_);
+      break;
+    case IDC_TRANSLATE_PAGE:
+      Translate(browser_);
+      break;
+    case IDC_MANAGE_PASSWORDS_FOR_PAGE:
+      ManagePasswordsForPage(browser_);
+      break;
+
+    case IDC_CUT:
+    case IDC_COPY:
+    case IDC_PASTE:
+      CutCopyPaste(browser_, id);
+      break;
+
+    case IDC_FIND:
+      Find(browser_);
+      break;
+    case IDC_FIND_NEXT:
+      FindNext(browser_);
+      break;
+    case IDC_FIND_PREVIOUS:
+      FindPrevious(browser_);
+      break;
+
+    case IDC_ZOOM_PLUS:
+      Zoom(browser_, content::PAGE_ZOOM_IN);
+      break;
+    case IDC_ZOOM_NORMAL:
+      Zoom(browser_, content::PAGE_ZOOM_RESET);
+      break;
+    case IDC_ZOOM_MINUS:
+      Zoom(browser_, content::PAGE_ZOOM_OUT);
+      break;
+
+    case IDC_FOCUS_TOOLBAR:
+      base::RecordAction(base::UserMetricsAction(""Accel_Focus_Toolbar""));
+      FocusToolbar(browser_);
+      break;
+    case IDC_FOCUS_LOCATION:
+      base::RecordAction(base::UserMetricsAction(""Accel_Focus_Location""));
+      FocusLocationBar(browser_);
+      break;
+    case IDC_FOCUS_SEARCH:
+      base::RecordAction(base::UserMetricsAction(""Accel_Focus_Search""));
+      FocusSearch(browser_);
+      break;
+    case IDC_FOCUS_MENU_BAR:
+      FocusAppMenu(browser_);
+      break;
+    case IDC_FOCUS_BOOKMARKS:
+      base::RecordAction(base::UserMetricsAction(""Accel_Focus_Bookmarks""));
+      FocusBookmarksToolbar(browser_);
+      break;
+    case IDC_FOCUS_INACTIVE_POPUP_FOR_ACCESSIBILITY:
+      FocusInactivePopupForAccessibility(browser_);
+      break;
+    case IDC_FOCUS_NEXT_PANE:
+      FocusNextPane(browser_);
+      break;
+    case IDC_FOCUS_PREVIOUS_PANE:
+      FocusPreviousPane(browser_);
+      break;
+
+    case IDC_OPEN_FILE:
+      browser_->OpenFile();
+      break;
+    case IDC_CREATE_SHORTCUT:
+      CreateBookmarkAppFromCurrentWebContents(browser_,
+                                              true /* force_shortcut_app */);
+      break;
+    case IDC_INSTALL_PWA:
+      CreateBookmarkAppFromCurrentWebContents(browser_,
+                                              false /* force_shortcut_app */);
+      break;
+    case IDC_DEV_TOOLS:
+      ToggleDevToolsWindow(browser_, DevToolsToggleAction::Show());
+      break;
+    case IDC_DEV_TOOLS_CONSOLE:
+      ToggleDevToolsWindow(browser_, DevToolsToggleAction::ShowConsolePanel());
+      break;
+    case IDC_DEV_TOOLS_DEVICES:
+      InspectUI::InspectDevices(browser_);
+      break;
+    case IDC_DEV_TOOLS_INSPECT:
+      ToggleDevToolsWindow(browser_, DevToolsToggleAction::Inspect());
+      break;
+    case IDC_DEV_TOOLS_TOGGLE:
+      ToggleDevToolsWindow(browser_, DevToolsToggleAction::Toggle());
+      break;
+    case IDC_TASK_MANAGER:
+      OpenTaskManager(browser_);
+      break;
+#if defined(OS_CHROMEOS)
+    case IDC_TAKE_SCREENSHOT:
+      TakeScreenshot();
+      break;
+#endif
+#if defined(GOOGLE_CHROME_BUILD)
+    case IDC_FEEDBACK:
+      OpenFeedbackDialog(browser_, kFeedbackSourceBrowserCommand);
+      break;
+#endif
+    case IDC_SHOW_BOOKMARK_BAR:
+      ToggleBookmarkBar(browser_);
+      break;
+    case IDC_PROFILING_ENABLED:
+      Profiling::Toggle();
+      break;
+
+    case IDC_SHOW_BOOKMARK_MANAGER:
+      ShowBookmarkManager(browser_);
+      break;
+    case IDC_SHOW_APP_MENU:
+      base::RecordAction(base::UserMetricsAction(""Accel_Show_App_Menu""));
+      ShowAppMenu(browser_);
+      break;
+    case IDC_SHOW_AVATAR_MENU:
+      ShowAvatarMenu(browser_);
+      break;
+    case IDC_SHOW_HISTORY:
+      ShowHistory(browser_);
+      break;
+    case IDC_SHOW_DOWNLOADS:
+      ShowDownloads(browser_);
+      break;
+    case IDC_MANAGE_EXTENSIONS:
+      ShowExtensions(browser_, std::string());
+      break;
+    case IDC_OPTIONS:
+      ShowSettings(browser_);
+      break;
+    case IDC_EDIT_SEARCH_ENGINES:
+      ShowSearchEngineSettings(browser_);
+      break;
+    case IDC_VIEW_PASSWORDS:
+      ShowPasswordManager(browser_);
+      break;
+    case IDC_CLEAR_BROWSING_DATA:
+      ShowClearBrowsingDataDialog(browser_);
+      break;
+    case IDC_IMPORT_SETTINGS:
+      ShowImportDialog(browser_);
+      break;
+    case IDC_TOGGLE_REQUEST_TABLET_SITE:
+      ToggleRequestTabletSite(browser_);
+      break;
+    case IDC_ABOUT:
+      ShowAboutChrome(browser_);
+      break;
+    case IDC_UPGRADE_DIALOG:
+      OpenUpdateChromeDialog(browser_);
+      break;
+    case IDC_HELP_PAGE_VIA_KEYBOARD:
+      ShowHelp(browser_, HELP_SOURCE_KEYBOARD);
+      break;
+    case IDC_HELP_PAGE_VIA_MENU:
+      ShowHelp(browser_, HELP_SOURCE_MENU);
+      break;
+    case IDC_SHOW_BETA_FORUM:
+      ShowBetaForum(browser_);
+      break;
+    case IDC_SHOW_SIGNIN:
+      ShowBrowserSigninOrSettings(
+          browser_, signin_metrics::AccessPoint::ACCESS_POINT_MENU);
+      break;
+    case IDC_DISTILL_PAGE:
+      DistillCurrentPage(browser_);
+      break;
+    case IDC_ROUTE_MEDIA:
+      RouteMedia(browser_);
+      break;
+    case IDC_WINDOW_MUTE_SITE:
+      MuteSite(browser_);
+      break;
+    case IDC_WINDOW_PIN_TAB:
+      PinTab(browser_);
+      break;
+
+    case IDC_COPY_URL:
+      CopyURL(browser_);
+      break;
+    case IDC_OPEN_IN_CHROME:
+      OpenInChrome(browser_);
+      break;
+    case IDC_SITE_SETTINGS:
+      ShowSiteSettings(
+          browser_,
+          browser_->tab_strip_model()->GetActiveWebContents()->GetVisibleURL());
+      break;
+    case IDC_HOSTED_APP_MENU_APP_INFO:
+      ShowPageInfoDialog(browser_->tab_strip_model()->GetActiveWebContents(),
+                         bubble_anchor_util::kAppMenuButton);
+      break;
+
+    default:
+      LOG(WARNING) << ""Received Unimplemented Command: "" << id;
+      break;
+  }
+
+  return true;
+}
+"
+" void WebGL2RenderingContextBase::bindSampler(GLuint unit,
+                                              WebGLSampler* sampler) {
+  if (isContextLost())
+    return;
+   bool deleted;
+   if (!CheckObjectToBeBound(""bindSampler"", sampler, deleted))
+     return;
+  if (deleted) {
+    SynthesizeGLError(GL_INVALID_OPERATION, ""bindSampler"",
+                      ""attempted to bind a deleted sampler"");
+    return;
+  }
+
+  if (unit >= sampler_units_.size()) {
+    SynthesizeGLError(GL_INVALID_VALUE, ""bindSampler"",
+                      ""texture unit out of range"");
+    return;
+  }
+
+  sampler_units_[unit] = sampler;
+
+  ContextGL()->BindSampler(unit, ObjectOrZero(sampler));
+}
+"
+" void WebGL2RenderingContextBase::bindVertexArray(
+     WebGLVertexArrayObject* vertex_array) {
+  if (isContextLost())
+     return;
+  if (vertex_array &&
+      (vertex_array->IsDeleted() || !vertex_array->Validate(nullptr, this))) {
+     SynthesizeGLError(GL_INVALID_OPERATION, ""bindVertexArray"",
+                      ""invalid vertexArray"");
+     return;
+   }
+ 
+  if (vertex_array && !vertex_array->IsDefaultObject() &&
+      vertex_array->Object()) {
+    ContextGL()->BindVertexArrayOES(ObjectOrZero(vertex_array));
+
+    vertex_array->SetHasEverBeenBound();
+    SetBoundVertexArrayObject(vertex_array);
+  } else {
+    ContextGL()->BindVertexArrayOES(0);
+    SetBoundVertexArrayObject(nullptr);
+  }
+}
+"
+" void WebGL2RenderingContextBase::deleteVertexArray(
+     WebGLVertexArrayObject* vertex_array) {
+  if (isContextLost() || !vertex_array)
+     return;
+ 
+   if (!vertex_array->IsDefaultObject() &&
+      vertex_array == bound_vertex_array_object_)
+    SetBoundVertexArrayObject(nullptr);
+
+  vertex_array->DeleteObject(ContextGL());
+}
+"
+"void WebGL2RenderingContextBase::framebufferTextureLayer(GLenum target,
+                                                         GLenum attachment,
+                                                         WebGLTexture* texture,
+                                                         GLint level,
+                                                         GLint layer) {
+  if (isContextLost() || !ValidateFramebufferFuncParameters(
+                              ""framebufferTextureLayer"", target, attachment))
+     return;
+   if (texture && !texture->Validate(ContextGroup(), this)) {
+    SynthesizeGLError(GL_INVALID_VALUE, ""framebufferTextureLayer"",
+                      ""no texture or texture not from this context"");
+     return;
+   }
+   GLenum textarget = texture ? texture->GetTarget() : 0;
+  if (texture) {
+    if (textarget != GL_TEXTURE_3D && textarget != GL_TEXTURE_2D_ARRAY) {
+      SynthesizeGLError(GL_INVALID_OPERATION, ""framebufferTextureLayer"",
+                        ""invalid texture type"");
+      return;
+    }
+    if (!ValidateTexFuncLayer(""framebufferTextureLayer"", textarget, layer))
+      return;
+    if (!ValidateTexFuncLevel(""framebufferTextureLayer"", textarget, level))
+      return;
+  }
+
+  WebGLFramebuffer* framebuffer_binding = GetFramebufferBinding(target);
+  if (!framebuffer_binding || !framebuffer_binding->Object()) {
+    SynthesizeGLError(GL_INVALID_OPERATION, ""framebufferTextureLayer"",
+                      ""no framebuffer bound"");
+    return;
+  }
+  if (framebuffer_binding && framebuffer_binding->Opaque()) {
+    SynthesizeGLError(GL_INVALID_OPERATION, ""framebufferTextureLayer"",
+                      ""opaque framebuffer bound"");
+    return;
+  }
+  framebuffer_binding->SetAttachmentForBoundFramebuffer(
+      target, attachment, textarget, texture, level, layer);
+  ApplyStencilTest();
+}
+"
+" GLboolean WebGL2RenderingContextBase::isTransformFeedback(
+     WebGLTransformFeedback* feedback) {
+  if (isContextLost() || !feedback)
+     return 0;
+ 
+   if (!feedback->HasEverBeenBound())
+    return 0;
+
+  return ContextGL()->IsTransformFeedback(feedback->Object());
+}
+"
+" GLboolean WebGL2RenderingContextBase::isVertexArray(
+     WebGLVertexArrayObject* vertex_array) {
+  if (isContextLost() || !vertex_array)
+     return 0;
+ 
+   if (!vertex_array->HasEverBeenBound())
+    return 0;
+
+  return ContextGL()->IsVertexArrayOES(vertex_array->Object());
+}
+"
+" GLboolean WebGLRenderingContextBase::isBuffer(WebGLBuffer* buffer) {
+  if (!buffer || isContextLost())
+     return 0;
+ 
+   if (!buffer->HasEverBeenBound())
+    return 0;
+  if (buffer->IsDeleted())
+    return 0;
+
+  return ContextGL()->IsBuffer(buffer->Object());
+}
+"
+" GLboolean WebGLRenderingContextBase::isFramebuffer(
+     WebGLFramebuffer* framebuffer) {
+  if (!framebuffer || isContextLost())
+     return 0;
+ 
+   if (!framebuffer->HasEverBeenBound())
+    return 0;
+  if (framebuffer->IsDeleted())
+    return 0;
+
+  return ContextGL()->IsFramebuffer(framebuffer->Object());
+ }
+"
+" GLboolean WebGLRenderingContextBase::isProgram(WebGLProgram* program) {
+  if (!program || isContextLost())
+     return 0;
+ 
+   return ContextGL()->IsProgram(program->Object());
+ }
+"
+" GLboolean WebGLRenderingContextBase::isRenderbuffer(
+     WebGLRenderbuffer* renderbuffer) {
+  if (!renderbuffer || isContextLost())
+     return 0;
+ 
+   if (!renderbuffer->HasEverBeenBound())
+    return 0;
+  if (renderbuffer->IsDeleted())
+    return 0;
+
+  return ContextGL()->IsRenderbuffer(renderbuffer->Object());
+ }
+"
+" GLboolean WebGLRenderingContextBase::isShader(WebGLShader* shader) {
+  if (!shader || isContextLost())
+     return 0;
+ 
+   return ContextGL()->IsShader(shader->Object());
+ }
+"
+" GLboolean WebGLRenderingContextBase::isTexture(WebGLTexture* texture) {
+  if (!texture || isContextLost())
+     return 0;
+ 
+   if (!texture->HasEverBeenBound())
+    return 0;
+  if (texture->IsDeleted())
+    return 0;
+
+  return ContextGL()->IsTexture(texture->Object());
+}
+"
+" void GCInfoTable::EnsureGCInfoIndex(const GCInfo* gc_info,
+                                     size_t* gc_info_index_slot) {
+   DCHECK(gc_info);
+   DCHECK(gc_info_index_slot);
+  DEFINE_THREAD_SAFE_STATIC_LOCAL(Mutex, mutex, ());
+  MutexLocker locker(mutex);
+ 
+   if (*gc_info_index_slot)
+     return;
+ 
+  int index = ++gc_info_index_;
+   size_t gc_info_index = static_cast<size_t>(index);
+   CHECK(gc_info_index < GCInfoTable::kMaxIndex);
+  if (gc_info_index >= gc_info_table_size_)
+     Resize();
+ 
+  g_gc_info_table[gc_info_index] = gc_info;
+   ReleaseStore(reinterpret_cast<int*>(gc_info_index_slot), index);
+ }
+"
+"void GCInfoTable::Init() {
+  CHECK(!g_gc_info_table);
+   Resize();
+ }
+"
+" void GCInfoTable::Resize() {
+  static const int kGcInfoZapValue = 0x33;
+  const size_t kInitialSize = 512;
+  size_t new_size =
+      gc_info_table_size_ ? 2 * gc_info_table_size_ : kInitialSize;
+  DCHECK(new_size < GCInfoTable::kMaxIndex);
+  g_gc_info_table =
+      reinterpret_cast<GCInfo const**>(WTF::Partitions::FastRealloc(
+          g_gc_info_table, new_size * sizeof(GCInfo), ""GCInfo""));
+  DCHECK(g_gc_info_table);
+  memset(reinterpret_cast<uint8_t*>(g_gc_info_table) +
+             gc_info_table_size_ * sizeof(GCInfo),
+         kGcInfoZapValue, (new_size - gc_info_table_size_) * sizeof(GCInfo));
+  gc_info_table_size_ = new_size;
+ }
+"
+"void ThreadHeap::TakeSnapshot(SnapshotType type) {
+  DCHECK(thread_state_->InAtomicMarkingPause());
+ 
+  ThreadState::GCSnapshotInfo info(GCInfoTable::GcInfoIndex() + 1);
+   String thread_dump_name =
+       String::Format(""blink_gc/thread_%lu"",
+                      static_cast<unsigned long>(thread_state_->ThreadId()));
+  const String heaps_dump_name = thread_dump_name + ""/heaps"";
+  const String classes_dump_name = thread_dump_name + ""/classes"";
+
+  int number_of_heaps_reported = 0;
+#define SNAPSHOT_HEAP(ArenaType)                                          \
+  {                                                                       \
+    number_of_heaps_reported++;                                           \
+    switch (type) {                                                       \
+      case SnapshotType::kHeapSnapshot:                                   \
+        arenas_[BlinkGC::k##ArenaType##ArenaIndex]->TakeSnapshot(         \
+            heaps_dump_name + ""/"" #ArenaType, info);                      \
+        break;                                                            \
+      case SnapshotType::kFreelistSnapshot:                               \
+        arenas_[BlinkGC::k##ArenaType##ArenaIndex]->TakeFreelistSnapshot( \
+            heaps_dump_name + ""/"" #ArenaType);                            \
+        break;                                                            \
+      default:                                                            \
+        NOTREACHED();                                                     \
+    }                                                                     \
+  }
+
+  SNAPSHOT_HEAP(NormalPage1);
+  SNAPSHOT_HEAP(NormalPage2);
+  SNAPSHOT_HEAP(NormalPage3);
+  SNAPSHOT_HEAP(NormalPage4);
+  SNAPSHOT_HEAP(EagerSweep);
+  SNAPSHOT_HEAP(Vector1);
+  SNAPSHOT_HEAP(Vector2);
+  SNAPSHOT_HEAP(Vector3);
+  SNAPSHOT_HEAP(Vector4);
+  SNAPSHOT_HEAP(InlineVector);
+  SNAPSHOT_HEAP(HashTable);
+  SNAPSHOT_HEAP(LargeObject);
+  FOR_EACH_TYPED_ARENA(SNAPSHOT_HEAP);
+
+  DCHECK_EQ(number_of_heaps_reported, BlinkGC::kNumberOfArenas);
+
+#undef SNAPSHOT_HEAP
+
+  if (type == SnapshotType::kFreelistSnapshot)
+    return;
+
+  size_t total_live_count = 0;
+   size_t total_dead_count = 0;
+   size_t total_live_size = 0;
+   size_t total_dead_size = 0;
+  for (size_t gc_info_index = 1; gc_info_index <= GCInfoTable::GcInfoIndex();
+       ++gc_info_index) {
+     total_live_count += info.live_count[gc_info_index];
+     total_dead_count += info.dead_count[gc_info_index];
+     total_live_size += info.live_size[gc_info_index];
+    total_dead_size += info.dead_size[gc_info_index];
+  }
+
+  base::trace_event::MemoryAllocatorDump* thread_dump =
+      BlinkGCMemoryDumpProvider::Instance()
+          ->CreateMemoryAllocatorDumpForCurrentGC(thread_dump_name);
+  thread_dump->AddScalar(""live_count"", ""objects"", total_live_count);
+  thread_dump->AddScalar(""dead_count"", ""objects"", total_dead_count);
+  thread_dump->AddScalar(""live_size"", ""bytes"", total_live_size);
+  thread_dump->AddScalar(""dead_size"", ""bytes"", total_dead_size);
+
+  base::trace_event::MemoryAllocatorDump* heaps_dump =
+      BlinkGCMemoryDumpProvider::Instance()
+          ->CreateMemoryAllocatorDumpForCurrentGC(heaps_dump_name);
+  base::trace_event::MemoryAllocatorDump* classes_dump =
+      BlinkGCMemoryDumpProvider::Instance()
+          ->CreateMemoryAllocatorDumpForCurrentGC(classes_dump_name);
+  BlinkGCMemoryDumpProvider::Instance()
+      ->CurrentProcessMemoryDump()
+      ->AddOwnershipEdge(classes_dump->guid(), heaps_dump->guid());
+}
+"
+"void ThreadHeap::WriteBarrier(void* value) {
+  DCHECK(thread_state_->IsIncrementalMarking());
+  DCHECK(value);
+  DCHECK_NE(value, reinterpret_cast<void*>(-1));
+
+  BasePage* const page = PageFromObject(value);
+  HeapObjectHeader* const header =
+      page->IsLargeObjectPage()
+          ? static_cast<LargeObjectPage*>(page)->GetHeapObjectHeader()
+          : static_cast<NormalPage*>(page)->FindHeaderFromAddress(
+                reinterpret_cast<Address>(const_cast<void*>(value)));
+  if (header->IsMarked())
+    return;
+
+   header->Mark();
+   marking_worklist_->Push(
+       WorklistTaskId::MainThread,
+      {header->Payload(), ThreadHeap::GcInfo(header->GcInfoIndex())->trace_});
+ }
+"
+" void HeapObjectHeader::Finalize(Address object, size_t object_size) {
+   HeapAllocHooks::FreeHookIfEnabled(object);
+  const GCInfo* gc_info = ThreadHeap::GcInfo(GcInfoIndex());
+   if (gc_info->HasFinalizer())
+     gc_info->finalize_(object);
+ 
+  ASAN_RETIRE_CONTAINER_ANNOTATION(object, object_size);
+}
+"
+"  void ProcessBackingStore(HeapObjectHeader* header) {
+     EXPECT_TRUE(header->IsValid());
+     EXPECT_TRUE(header->IsMarked());
+     header->Unmark();
+    ThreadHeap::GcInfo(header->GcInfoIndex())->trace_(this, header->Payload());
+   }
+"
+" void MarkingVisitor::ConservativelyMarkHeader(HeapObjectHeader* header) {
+  const GCInfo* gc_info = ThreadHeap::GcInfo(header->GcInfoIndex());
+   if (gc_info->HasVTable() && !VTableInitialized(header->Payload())) {
+    MarkHeaderNoTracing(header);
+#if DCHECK_IS_ON()
+    DCHECK(IsUninitializedMemory(header->Payload(), header->PayloadSize()));
+#endif
+  } else {
+    MarkHeader(header, gc_info->trace_);
+  }
+}
+"
+"void ProcessHeap::Init() {
+  total_allocated_space_ = 0;
+   total_allocated_object_size_ = 0;
+   total_marked_object_size_ = 0;
+ 
+  GCInfoTable::Init();
+   base::SamplingHeapProfiler::SetHooksInstallCallback([]() {
+     HeapAllocHooks::SetAllocationHook(&BlinkGCAllocHook);
+     HeapAllocHooks::SetFreeHook(&BlinkGCFreeHook);
+  });
+}
+"
+"bool Performance::PassesTimingAllowCheck(
+    const ResourceResponse& response,
+     const SecurityOrigin& initiator_security_origin,
+     const AtomicString& original_timing_allow_origin,
+     ExecutionContext* context) {
+   scoped_refptr<const SecurityOrigin> resource_origin =
+      SecurityOrigin::Create(response.Url());
+   if (resource_origin->IsSameSchemeHostPort(&initiator_security_origin))
+     return true;
+ 
+  const AtomicString& timing_allow_origin_string =
+      original_timing_allow_origin.IsEmpty()
+          ? response.HttpHeaderField(HTTPNames::Timing_Allow_Origin)
+          : original_timing_allow_origin;
+  if (timing_allow_origin_string.IsEmpty() ||
+      EqualIgnoringASCIICase(timing_allow_origin_string, ""null""))
+    return false;
+
+  if (timing_allow_origin_string == ""*"") {
+    UseCounter::Count(context, WebFeature::kStarInTimingAllowOrigin);
+    return true;
+  }
+
+  const String& security_origin = initiator_security_origin.ToString();
+  Vector<String> timing_allow_origins;
+  timing_allow_origin_string.GetString().Split(',', timing_allow_origins);
+  if (timing_allow_origins.size() > 1) {
+    UseCounter::Count(context, WebFeature::kMultipleOriginsInTimingAllowOrigin);
+  } else if (timing_allow_origins.size() == 1 &&
+             timing_allow_origin_string != ""*"") {
+    UseCounter::Count(context, WebFeature::kSingleOriginInTimingAllowOrigin);
+  }
+  for (const String& allow_origin : timing_allow_origins) {
+    const String allow_origin_stripped = allow_origin.StripWhiteSpace();
+    if (allow_origin_stripped == security_origin ||
+        allow_origin_stripped == ""*"") {
+      return true;
+    }
+  }
+
+  return false;
+}
+"
+"MediaElementAudioSourceHandler::MediaElementAudioSourceHandler(
+    AudioNode& node,
+    HTMLMediaElement& media_element)
+    : AudioHandler(kNodeTypeMediaElementAudioSource,
+                   node,
+                   node.context()->sampleRate()),
+       media_element_(media_element),
+       source_number_of_channels_(0),
+       source_sample_rate_(0),
+      passes_current_src_cors_access_check_(
+          PassesCurrentSrcCORSAccessCheck(media_element.currentSrc())),
+      maybe_print_cors_message_(!passes_current_src_cors_access_check_),
+      current_src_string_(media_element.currentSrc().GetString()) {
+   DCHECK(IsMainThread());
+  AddOutput(2);
+
+  if (Context()->GetExecutionContext()) {
+    task_runner_ = Context()->GetExecutionContext()->GetTaskRunner(
+        TaskType::kMediaElementEvent);
+  }
+
+  Initialize();
+}
+"
+"void MediaElementAudioSourceHandler::OnCurrentSrcChanged(
+    const KURL& current_src) {
+  DCHECK(IsMainThread());
+  Locker<MediaElementAudioSourceHandler> locker(*this);
+ 
+  passes_current_src_cors_access_check_ =
+      PassesCurrentSrcCORSAccessCheck(current_src);
+ 
+  maybe_print_cors_message_ = !passes_current_src_cors_access_check_;
+  current_src_string_ = current_src.GetString();
+}
+"
+"void MediaElementAudioSourceNode::OnCurrentSrcChanged(const KURL& current_src) {
+  GetMediaElementAudioSourceHandler().OnCurrentSrcChanged(current_src);
+}
+"
+"bool MediaElementAudioSourceHandler::PassesCORSAccessCheck() {
+  DCHECK(MediaElement());
+  return (MediaElement()->GetWebMediaPlayer() &&
+          MediaElement()->GetWebMediaPlayer()->DidPassCORSAccessCheck()) ||
+         passes_current_src_cors_access_check_;
+}
+"
+"bool MediaElementAudioSourceHandler::PassesCurrentSrcCORSAccessCheck(
+    const KURL& current_src) {
+  DCHECK(IsMainThread());
+  return Context()->GetSecurityOrigin() &&
+         Context()->GetSecurityOrigin()->CanRequest(current_src);
+ }
+"
+"void MediaElementAudioSourceHandler::Process(size_t number_of_frames) {
+  AudioBus* output_bus = Output(0).Bus();
+
+  MutexTryLocker try_locker(process_lock_);
+  if (try_locker.Locked()) {
+    if (!MediaElement() || !source_sample_rate_) {
+      output_bus->Zero();
+      return;
+    }
+
+    if (source_number_of_channels_ != output_bus->NumberOfChannels()) {
+      output_bus->Zero();
+      return;
+    }
+
+    AudioSourceProvider& provider = MediaElement()->GetAudioSourceProvider();
+    if (multi_channel_resampler_.get()) {
+      DCHECK_NE(source_sample_rate_, Context()->sampleRate());
+      multi_channel_resampler_->Process(&provider, output_bus,
+                                        number_of_frames);
+    } else {
+      DCHECK_EQ(source_sample_rate_, Context()->sampleRate());
+       provider.ProvideInput(output_bus, number_of_frames);
+     }
+    if (!PassesCORSAccessCheck()) {
+      if (maybe_print_cors_message_) {
+        maybe_print_cors_message_ = false;
+        PostCrossThreadTask(
+            *task_runner_, FROM_HERE,
+            CrossThreadBind(&MediaElementAudioSourceHandler::PrintCORSMessage,
+                            WrapRefCounted(this), current_src_string_));
+      }
+       output_bus->Zero();
+     }
+   } else {
+    output_bus->Zero();
+  }
+}
+"
+"void WebGLRenderingContextBase::TexImageHelperImageData(
+    TexImageFunctionID function_id,
+    GLenum target,
+    GLint level,
+    GLint internalformat,
+    GLint border,
+    GLenum format,
+    GLenum type,
+    GLsizei depth,
+    GLint xoffset,
+    GLint yoffset,
+    GLint zoffset,
+    ImageData* pixels,
+    const IntRect& source_image_rect,
+    GLint unpack_image_height) {
+  const char* func_name = GetTexImageFunctionName(function_id);
+  if (isContextLost())
+    return;
+  DCHECK(pixels);
+  if (pixels->data()->BufferBase()->IsNeutered()) {
+    SynthesizeGLError(GL_INVALID_VALUE, func_name,
+                      ""The source data has been neutered."");
+    return;
+  }
+  if (!ValidateTexImageBinding(func_name, function_id, target))
+    return;
+  TexImageFunctionType function_type;
+  if (function_id == kTexImage2D || function_id == kTexImage3D)
+    function_type = kTexImage;
+  else
+    function_type = kTexSubImage;
+  if (!ValidateTexFunc(func_name, function_type, kSourceImageData, target,
+                       level, internalformat, pixels->width(), pixels->height(),
+                       depth, border, format, type, xoffset, yoffset, zoffset))
+    return;
+
+  bool selecting_sub_rectangle = false;
+  if (!ValidateTexImageSubRectangle(
+          func_name, function_id, pixels, source_image_rect, depth,
+          unpack_image_height, &selecting_sub_rectangle)) {
+    return;
+  }
+  IntRect adjusted_source_image_rect = source_image_rect;
+  if (unpack_flip_y_) {
+    adjusted_source_image_rect.SetY(pixels->height() -
+                                    adjusted_source_image_rect.MaxY());
+  }
+
+  Vector<uint8_t> data;
+  bool need_conversion = true;
+  if (!unpack_flip_y_ && !unpack_premultiply_alpha_ && format == GL_RGBA &&
+      type == GL_UNSIGNED_BYTE && !selecting_sub_rectangle && depth == 1) {
+    need_conversion = false;
+  } else {
+    if (type == GL_UNSIGNED_INT_10F_11F_11F_REV) {
+      type = GL_FLOAT;
+    }
+    if (!WebGLImageConversion::ExtractImageData(
+            pixels->data()->Data(),
+            WebGLImageConversion::DataFormat::kDataFormatRGBA8, pixels->Size(),
+            adjusted_source_image_rect, depth, unpack_image_height, format,
+            type, unpack_flip_y_, unpack_premultiply_alpha_, data)) {
+      SynthesizeGLError(GL_INVALID_VALUE, func_name, ""bad image data"");
+      return;
+    }
+  }
+  ScopedUnpackParametersResetRestore temporary_reset_unpack(this);
+  const uint8_t* bytes = need_conversion ? data.data() : pixels->data()->Data();
+  if (function_id == kTexImage2D) {
+    DCHECK_EQ(unpack_image_height, 0);
+    TexImage2DBase(
+        target, level, internalformat, adjusted_source_image_rect.Width(),
+        adjusted_source_image_rect.Height(), border, format, type, bytes);
+  } else if (function_id == kTexSubImage2D) {
+    DCHECK_EQ(unpack_image_height, 0);
+    ContextGL()->TexSubImage2D(
+        target, level, xoffset, yoffset, adjusted_source_image_rect.Width(),
+         adjusted_source_image_rect.Height(), format, type, bytes);
+   } else {
+     GLint upload_height = adjusted_source_image_rect.Height();
+    if (unpack_image_height) {
+      upload_height = unpack_image_height;
+    }
+     if (function_id == kTexImage3D) {
+       ContextGL()->TexImage3D(target, level, internalformat,
+                               adjusted_source_image_rect.Width(), upload_height,
+                              depth, border, format, type, bytes);
+    } else {
+      DCHECK_EQ(function_id, kTexSubImage3D);
+      ContextGL()->TexSubImage3D(target, level, xoffset, yoffset, zoffset,
+                                 adjusted_source_image_rect.Width(),
+                                 upload_height, depth, format, type, bytes);
+    }
+  }
+}
+"
+"IDNSpoofChecker::IDNSpoofChecker() {
+  UErrorCode status = U_ZERO_ERROR;
+  checker_ = uspoof_open(&status);
+  if (U_FAILURE(status)) {
+    checker_ = nullptr;
+    return;
+  }
+
+
+  uspoof_setRestrictionLevel(checker_, USPOOF_HIGHLY_RESTRICTIVE);
+
+  SetAllowedUnicodeSet(&status);
+
+  int32_t checks = uspoof_getChecks(checker_, &status) | USPOOF_AUX_INFO;
+  uspoof_setChecks(checker_, checks, &status);
+
+  deviation_characters_ = icu::UnicodeSet(
+      UNICODE_STRING_SIMPLE(""[\\u00df\\u03c2\\u200c\\u200d]""), status);
+  deviation_characters_.freeze();
+
+  non_ascii_latin_letters_ =
+      icu::UnicodeSet(UNICODE_STRING_SIMPLE(""[[:Latin:] - [a-zA-Z]]""), status);
+  non_ascii_latin_letters_.freeze();
+
+  kana_letters_exceptions_ = icu::UnicodeSet(
+      UNICODE_STRING_SIMPLE(""[\\u3078-\\u307a\\u30d8-\\u30da\\u30fb-\\u30fe]""),
+      status);
+  kana_letters_exceptions_.freeze();
+  combining_diacritics_exceptions_ =
+      icu::UnicodeSet(UNICODE_STRING_SIMPLE(""[\\u0300-\\u0339]""), status);
+  combining_diacritics_exceptions_.freeze();
+
+  cyrillic_letters_latin_alike_ = icu::UnicodeSet(
+      icu::UnicodeString::fromUTF8(""[асԁеһіјӏорԛѕԝхуъЬҽпгѵѡ]""), status);
+  cyrillic_letters_latin_alike_.freeze();
+
+  cyrillic_letters_ =
+      icu::UnicodeSet(UNICODE_STRING_SIMPLE(""[[:Cyrl:]]""), status);
+  cyrillic_letters_.freeze();
+
+  DCHECK(U_SUCCESS(status));
+  lgc_letters_n_ascii_ = icu::UnicodeSet(
+      UNICODE_STRING_SIMPLE(""[[:Latin:][:Greek:][:Cyrillic:][0-9\\u002e_""
+                            ""\\u002d][\\u0300-\\u0339]]""),
+      status);
+  lgc_letters_n_ascii_.freeze();
+
+  UParseError parse_error;
+  diacritic_remover_.reset(icu::Transliterator::createFromRules(
+      UNICODE_STRING_SIMPLE(""DropAcc""),
+      icu::UnicodeString::fromUTF8(""::NFD; ::[:Nonspacing Mark:] Remove; ::NFC;""
+                                   "" ł > l; ø > o; đ > d;""),
+      UTRANS_FORWARD, parse_error, status));
+
+   extra_confusable_mapper_.reset(icu::Transliterator::createFromRules(
+       UNICODE_STRING_SIMPLE(""ExtraConf""),
+      icu::UnicodeString::fromUTF8(
+          ""[æӕ] > ae; [þϼҏ] > p; [ħнћңҥӈӊԋԧԩ] > h;""
+          ""[ĸκкқҝҟҡӄԟ] > k; [ŋпԥ] > n; œ > ce;""
+          ""[ŧтҭԏ] > t; [ƅьҍв] > b;  [ωшщพฟພຟ] > w;""
+           ""[мӎ] > m; [єҽҿၔ] > e; ґ > r; [ғӻ] > f;""
+           ""[ҫင] > c; ұ > y; [χҳӽӿ] > x;""
+           ""ԃ  > d; [ԍဌ] > g; [ടรຣຮ] > s; ၂ > j;""
+          ""[зҙӡ] > 3; [บບ] > u""),
+       UTRANS_FORWARD, parse_error, status));
+   DCHECK(U_SUCCESS(status))
+       << ""Spoofchecker initalization failed due to an error: ""
+      << u_errorName(status);
+}
+"
+"IDNSpoofChecker::IDNSpoofChecker() {
+  UErrorCode status = U_ZERO_ERROR;
+  checker_ = uspoof_open(&status);
+  if (U_FAILURE(status)) {
+    checker_ = nullptr;
+    return;
+  }
+
+
+  uspoof_setRestrictionLevel(checker_, USPOOF_HIGHLY_RESTRICTIVE);
+
+  SetAllowedUnicodeSet(&status);
+
+  int32_t checks = uspoof_getChecks(checker_, &status) | USPOOF_AUX_INFO;
+  uspoof_setChecks(checker_, checks, &status);
+
+  deviation_characters_ = icu::UnicodeSet(
+      UNICODE_STRING_SIMPLE(""[\\u00df\\u03c2\\u200c\\u200d]""), status);
+  deviation_characters_.freeze();
+
+  non_ascii_latin_letters_ =
+      icu::UnicodeSet(UNICODE_STRING_SIMPLE(""[[:Latin:] - [a-zA-Z]]""), status);
+  non_ascii_latin_letters_.freeze();
+
+  kana_letters_exceptions_ = icu::UnicodeSet(
+      UNICODE_STRING_SIMPLE(""[\\u3078-\\u307a\\u30d8-\\u30da\\u30fb-\\u30fe]""),
+      status);
+  kana_letters_exceptions_.freeze();
+  combining_diacritics_exceptions_ =
+      icu::UnicodeSet(UNICODE_STRING_SIMPLE(""[\\u0300-\\u0339]""), status);
+  combining_diacritics_exceptions_.freeze();
+
+  cyrillic_letters_latin_alike_ = icu::UnicodeSet(
+      icu::UnicodeString::fromUTF8(""[асԁеһіјӏорԛѕԝхуъЬҽпгѵѡ]""), status);
+  cyrillic_letters_latin_alike_.freeze();
+
+  cyrillic_letters_ =
+      icu::UnicodeSet(UNICODE_STRING_SIMPLE(""[[:Cyrl:]]""), status);
+  cyrillic_letters_.freeze();
+
+  DCHECK(U_SUCCESS(status));
+  lgc_letters_n_ascii_ = icu::UnicodeSet(
+      UNICODE_STRING_SIMPLE(""[[:Latin:][:Greek:][:Cyrillic:][0-9\\u002e_""
+                            ""\\u002d][\\u0300-\\u0339]]""),
+      status);
+  lgc_letters_n_ascii_.freeze();
+
+  UParseError parse_error;
+  diacritic_remover_.reset(icu::Transliterator::createFromRules(
+      UNICODE_STRING_SIMPLE(""DropAcc""),
+      icu::UnicodeString::fromUTF8(""::NFD; ::[:Nonspacing Mark:] Remove; ::NFC;""
+                                   "" ł > l; ø > o; đ > d;""),
+       UTRANS_FORWARD, parse_error, status));
+ 
+   extra_confusable_mapper_.reset(icu::Transliterator::createFromRules(
+       UNICODE_STRING_SIMPLE(""ExtraConf""),
+      icu::UnicodeString::fromUTF8(""[þϼҏ] > p; [ħнћңҥӈӊԋԧԩ] > h;""
+                                   ""[ĸκкқҝҟҡӄԟ] > k; [ŋп] > n; [ŧтҭԏ] > t;""
+                                   ""[ƅьҍв] > b;  [ωшщฟ] > w; [мӎ] > m;""
+                                   ""[єҽҿၔ] > e; ґ > r; [ғӻ] > f; [ҫင] > c;""
+                                   ""ұ > y; [χҳӽӿ] > x;""
+                                   ""ԃ  > d; [ԍဌ] > g; [ടร] > s; ၂ > j;""
+                                   ""[зӡ] > 3""),
+       UTRANS_FORWARD, parse_error, status));
+   DCHECK(U_SUCCESS(status))
+       << ""Spoofchecker initalization failed due to an error: ""
+      << u_errorName(status);
+}
+"
+"IDNSpoofChecker::IDNSpoofChecker() {
+  UErrorCode status = U_ZERO_ERROR;
+  checker_ = uspoof_open(&status);
+  if (U_FAILURE(status)) {
+    checker_ = nullptr;
+    return;
+  }
+
+
+  uspoof_setRestrictionLevel(checker_, USPOOF_HIGHLY_RESTRICTIVE);
+
+  SetAllowedUnicodeSet(&status);
+
+  int32_t checks = uspoof_getChecks(checker_, &status) | USPOOF_AUX_INFO;
+  uspoof_setChecks(checker_, checks, &status);
+
+  deviation_characters_ = icu::UnicodeSet(
+      UNICODE_STRING_SIMPLE(""[\\u00df\\u03c2\\u200c\\u200d]""), status);
+  deviation_characters_.freeze();
+
+  non_ascii_latin_letters_ =
+      icu::UnicodeSet(UNICODE_STRING_SIMPLE(""[[:Latin:] - [a-zA-Z]]""), status);
+  non_ascii_latin_letters_.freeze();
+
+  kana_letters_exceptions_ = icu::UnicodeSet(
+      UNICODE_STRING_SIMPLE(""[\\u3078-\\u307a\\u30d8-\\u30da\\u30fb-\\u30fe]""),
+      status);
+  kana_letters_exceptions_.freeze();
+  combining_diacritics_exceptions_ =
+      icu::UnicodeSet(UNICODE_STRING_SIMPLE(""[\\u0300-\\u0339]""), status);
+  combining_diacritics_exceptions_.freeze();
+
+  cyrillic_letters_latin_alike_ = icu::UnicodeSet(
+      icu::UnicodeString::fromUTF8(""[асԁеһіјӏорԛѕԝхуъЬҽпгѵѡ]""), status);
+  cyrillic_letters_latin_alike_.freeze();
+
+  cyrillic_letters_ =
+      icu::UnicodeSet(UNICODE_STRING_SIMPLE(""[[:Cyrl:]]""), status);
+  cyrillic_letters_.freeze();
+
+  DCHECK(U_SUCCESS(status));
+  lgc_letters_n_ascii_ = icu::UnicodeSet(
+      UNICODE_STRING_SIMPLE(""[[:Latin:][:Greek:][:Cyrillic:][0-9\\u002e_""
+                            ""\\u002d][\\u0300-\\u0339]]""),
+      status);
+  lgc_letters_n_ascii_.freeze();
+
+  UParseError parse_error;
+  diacritic_remover_.reset(icu::Transliterator::createFromRules(
+      UNICODE_STRING_SIMPLE(""DropAcc""),
+      icu::UnicodeString::fromUTF8(""::NFD; ::[:Nonspacing Mark:] Remove; ::NFC;""
+                                   "" ł > l; ø > o; đ > d;""),
+      UTRANS_FORWARD, parse_error, status));
+
+   extra_confusable_mapper_.reset(icu::Transliterator::createFromRules(
+       UNICODE_STRING_SIMPLE(""ExtraConf""),
+       icu::UnicodeString::fromUTF8(
+           ""[æӕ] > ae; [þϼҏ] > p; [ħнћңҥӈӊԋԧԩ] > h;""
+           ""[ĸκкқҝҟҡӄԟ] > k; [ŋпԥ] > n; œ > ce;""
+          ""[ŧтҭԏ] > t; [ƅьҍв] > b;  [ωшщฟ] > w;""
+           ""[мӎ] > m; [єҽҿၔ] > e; ґ > r; [ғӻ] > f;""
+           ""[ҫင] > c; ұ > y; [χҳӽӿ] > x;""
+          ""ԃ  > d; [ԍဌ] > g; [ടร] > s; ၂ > j;""
+          ""[зҙӡ] > 3""),
+       UTRANS_FORWARD, parse_error, status));
+   DCHECK(U_SUCCESS(status))
+       << ""Spoofchecker initalization failed due to an error: ""
+      << u_errorName(status);
+}
+"

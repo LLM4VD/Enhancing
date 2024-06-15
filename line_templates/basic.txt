@@ -1,0 +1,9 @@
+The following function is known to contain vulnerabilities. Your task is to locate the specific lines of code that cause these vulnerabilities. You should provide no more than 5 possible vulnerable lines of code. Answer only in the following JSON format:
+
+{
+  "LINE1": "code line 1",
+  "LINE2": "code line 2",
+  "LINE3": "code line 3",
+  "LINE4": "code line 4",
+  "LINE5": "code line 5"
+}
